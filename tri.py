@@ -4,6 +4,7 @@ import json
 import pickle
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import LabelEncoder
+from xgboost import XGBRegressor
 import numpy as np
 import argparse
 import matplotlib.pyplot as plt
@@ -35,6 +36,7 @@ MODEL_FILE = "ml_model.pkl"
 
 model = None
 label_encoder = None
+sensor_macs = []
 
 # Load YAML file
 def load_yaml(file_path):
@@ -43,82 +45,212 @@ def load_yaml(file_path):
     return {k.lower(): v for k, v in data.items()}  # Normalize MAC addresses to lowercase
 
 def init_database():
-    """Initialize SQLite database for ML training."""
+    """Initialize SQLite database and ensure all necessary columns exist."""
     conn = sqlite3.connect("training_data.db")
     cursor = conn.cursor()
+
+    # **Create training_data table (if not exists)**
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS training_data (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            persistent_id TEXT NOT NULL,
-            mac_address TEXT,
-            sensor_mac TEXT,
-            rssi FLOAT,
-            x FLOAT,
-            y FLOAT,
-            z FLOAT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
+    CREATE TABLE IF NOT EXISTS training_data (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        persistent_id TEXT NOT NULL,
+        mac_address TEXT,
+        rssi_json TEXT,  -- Stores multiple RSSI readings as JSON
+        x FLOAT DEFAULT NULL,
+        y FLOAT DEFAULT NULL,
+        z FLOAT DEFAULT NULL,
+        weight INTEGER DEFAULT 3,  -- Default weight for training data
+        position_available INTEGER DEFAULT 1,  -- 1 if (x, y, z) exists, 0 if RSSI-only
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
     """)
+
+    # **Create sensor_positions table (if not exists)**
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS sensor_positions (
+        mac_address TEXT PRIMARY KEY,
+        x FLOAT NOT NULL,
+        y FLOAT NOT NULL,
+        z FLOAT NOT NULL
+    );
+    """)
+
     conn.commit()
     conn.close()
 
+def load_config(file_path="config.yaml"):
+    """Loads sensor data, room data, and floor boundaries from YAML config."""
+    with open(file_path, "r") as file:
+        config = yaml.safe_load(file)
+
+    # Convert sensor positions from lists to tuples
+    config["sensors"] = {mac.lower(): {"name": sensor["name"], "position": tuple(sensor["position"])}
+                         for mac, sensor in config["sensors"].items()}
+
+#    print("Loaded sensor_data:", json.dumps(config["sensors"], indent=4))
+
+    # Convert floor boundaries to NumPy arrays
+    config["floor_boundaries"] = {int(k): np.array(v) for k, v in config["floor_boundaries"].items()}
+
+    return config
+
+# Load configuration at startup
+#config = load_config()
+
+#sensor_data = config["sensors"]
+#room_data = config["rooms"]
+#floor_boundaries = config["floor_boundaries"]
+
 def load_ml_model():
     global model, sensor_macs, label_encoder
+    sensor_macs = []  # Default empty list
+
     try:
         with open(MODEL_FILE, "rb") as f:
-            model, sensor_macs, label_encoder = pickle.load(f)
-        print(f"✅ Loaded ML model from {MODEL_FILE}")
+            model, loaded_sensor_macs, label_encoder = pickle.load(f)
+            sensor_macs = loaded_sensor_macs if loaded_sensor_macs else list(sensor_data.keys())
+
+#        print(f"✅ Loaded ML model from {MODEL_FILE}")
     except FileNotFoundError:
-        print("⚠️ No saved ML model found. Model will be trained when needed.")
+        print("⚠️ No saved ML model found. Loading sensor MACs from sensor_data...")
+        sensor_macs = list(sensor_data.keys())
+        model = None
+    except Exception as e:
+        print(f"❌ Error loading ML model: {e}")
+        model = None
 
-def train_ml_model():
-    """Train a machine learning model using all available RSSI data from all devices."""
-    global model, label_encoder, sensor_macs  # Ensure we use global instances
-
+def fetch_sensor_macs_from_db():
+    """Fetch distinct sensor MAC addresses from the database."""
     conn = sqlite3.connect("training_data.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT persistent_id, sensor_mac, rssi, x, y, z FROM training_data WHERE rssi IS NOT NULL")
-    data = cursor.fetchall()
+
+    cursor.execute("SELECT DISTINCT mac_address FROM training_data")
+    macs = [row[0] for row in cursor.fetchall()]
+
     conn.close()
 
-    if len(data) < 3:  # Lower the threshold to ensure learning
-        print("⚠️ Not enough valid training data available. Skipping training.")
-        return None
+#    print(f"✅ Loaded {len(macs)} sensor MACs from database.")
+    return macs
 
-    sensor_macs = sorted(set(row[1] for row in data))
-    persistent_ids = sorted(set(row[0] for row in data))
+def validate_rssi_data(persistent_id, rssi_json):
+    """Ensure we have enough valid RSSI readings for training or prediction."""
+    if not rssi_json:
+        print(f"⚠️ Skipping {persistent_id}: No RSSI data found in the database!")
+        return False
 
-    features = []
-    labels = []
-    device_identifiers = []
+#    print(f"📊 Validating RSSI data for {persistent_id}: {rssi_json}")
 
-    for row in data:
-        rssi_values = [row[2] if row[1] == mac else -100 for mac in sensor_macs]  # Default RSSI to -100 if missing
-        features.append(rssi_values)
-        labels.append([row[3], row[4], row[5]])  # X, Y, Z coordinates
-        device_identifiers.append(row[0])  # Persistent ID as categorical feature
+    rssi_dict = json.loads(rssi_json)
+    valid_rssi_values = [rssi for rssi in rssi_dict.values() if rssi > -100]  # Ignore -100 values
+
+    if len(valid_rssi_values) < 3:
+#        print(f"⚠️ Skipping {persistent_id}: Too few RSSI readings available ({len(valid_rssi_values)} found, need at least 3).")
+        return False
+
+#    print(f"📊 Parsed RSSI dictionary: {rssi_dict}")
+
+    valid_rssi_values = [rssi for rssi in rssi_dict.values() if isinstance(rssi, (int, float)) and rssi > -100]
+
+#    print(f"✅ {persistent_id} has {len(valid_rssi_values)} valid RSSI readings.")
+
+    if all(rssi == -100 for rssi in rssi_dict.values()):
+        print(f"⚠️ Skipping {persistent_id}: All RSSI values are invalid (-100 readings).")
+        return False
+
+    return True
+
+import numpy as np
+
+def train_ml_model():
+    global model, label_encoder, sensor_macs
+
+    print("🔄 Starting ML model training...")
+    conn = sqlite3.connect("training_data.db")
+    cursor = conn.cursor()
+
+    # **Always reload sensor MACs from the database**
+    sensor_macs = list(sensor_data.keys())
+
+    if not sensor_macs:
+        print("❌ No sensor MACs found! Training aborted.")
+        return
+
+    cursor.execute("""
+        SELECT persistent_id, mac_address, rssi_json, x, y, z, weight
+        FROM training_data
+        WHERE position_available = 1 OR weight = 2
+    """)
+    data_batch = cursor.fetchall()
+
+    if not data_batch:
+        print("⚠️ No valid training data found. Skipping ML training.")
+        conn.close()
+        return
+
+    print(f"✅ Found {len(data_batch)} training samples.")
+
+    features, labels, weights = [], [], []
+
+    for persistent_id, mac_address, rssi_json_str, x, y, z, weight in data_batch:
+        if not validate_rssi_data(persistent_id, rssi_json_str):
+            continue
+
+        try:
+            rssi_dict = json.loads(rssi_json_str)
+        except Exception:
+            print(f"❌ JSON decoding error for {persistent_id}")
+            continue
+
+        # **Ensure RSSI vector uses the same sensors from the database**
+        row_rssi = np.array([rssi_dict.get(mac, np.nan) for mac in sensor_macs])  # Use NaN instead of -100
+
+        if np.all(np.logical_or(np.isnan(row_rssi), row_rssi == -100)):
+            continue
+
+        # **Ensure position values are valid**
+        try:
+            pos = [float(x), float(y), float(z)]
+        except Exception as e:
+            print(f"❌ Skipping {persistent_id}: Could not convert position values to float: {x}, {y}, {z}")
+            continue
+
+        if any(not np.isfinite(v) for v in pos):
+            print(f"⚠️ Skipping {persistent_id}: Invalid position values (x={x}, y={y}, z={z})")
+            continue
+
+        features.append(row_rssi)
+        labels.append([x, y, z])
+        weights.append(weight)
+
+    conn.close()
+
+    if not features:
+        print("❌ No valid features found! Training aborted.")
+        return
 
     features = np.array(features)
     labels = np.array(labels)
+    weights = np.array(weights)
 
-    if label_encoder is None:
-        label_encoder = LabelEncoder()
-        label_encoder.fit(["generic"])
+    print(f"✅ Training ML model with {len(features)} samples.")
 
-    encoded_devices = label_encoder.fit_transform(device_identifiers)
-    features = np.column_stack((features, encoded_devices))
+    try:
+        model = XGBRegressor(n_estimators=200, learning_rate=0.05, max_depth=6, random_state=42)
 
-    model = RandomForestRegressor(n_estimators=100, random_state=42)
-    model.fit(features, labels)
+        print("🔍 Checking labels for NaN or infinite values...")
+        if np.any(np.isnan(labels)) or np.any(np.isinf(labels)):
+            print(f"❌ ERROR: NaN or Inf detected in labels! Aborting training.")
+            return
 
-    print(f"✅ ML model trained on {len(features)} samples across multiple devices.")
+        model.fit(features, labels, sample_weight=weights)
+        print(f"✅ ML model trained on {len(features)} samples.")
 
-    # **Ensure the model is saved**
-    with open(MODEL_FILE, "wb") as f:
-        pickle.dump((model, sensor_macs, label_encoder), f)
-    print(f"💾 ML Model saved to {MODEL_FILE}")
+        # **Save the updated model along with sensor_macs**
+        with open(MODEL_FILE, "wb") as f:
+            pickle.dump((model, sensor_macs, label_encoder), f)
 
-    return model, sensor_macs, label_encoder
+    except Exception as e:
+        print(f"❌ Error during ML training: {e}")
 
 def generate_room_color(room_name):
     """Generate a stable color for a room based on its name."""
@@ -130,179 +262,235 @@ def generate_room_color(room_name):
 
 # Trilateration function
 def trilaterate(sensors, distances):
-    def residuals(pos, sensors, distances):
-        return [np.linalg.norm(pos - np.array(sensor)) - dist for sensor, dist in zip(sensors, distances)]
+    """Compute device position based on sensor positions and estimated distances."""
 
-    # Debugging: Print input values before running least squares
-    print(f"📡 Trilateration Sensors: {sensors}")
-    print(f"📏 Trilateration Distances: {distances}")
+    def residuals(pos, sensors, distances, weights):
+        """Calculate the error between estimated and actual distances."""
+        return weights * (np.linalg.norm(pos - np.array(sensors), axis=1) - distances)
 
-    # Initial guess (center of all sensors)
+    print(f"📡 Trilateration Sensors (Positions): {sensors}")
+    print(f"📏 Trilateration Distances (Meters): {distances}")
+
+    if len(sensors) < 3:
+        print("⚠️ Not enough sensors for trilateration.")
+        return None
+
+    sensors = np.array(sensors)
+    distances = np.array(distances)
+
+    # Fix: Ensure distances are within a reasonable range
+    distances = np.clip(distances, -2, 13)  # Min 0.5m, Max 15m
+
+    # Fix: Ensure Z-axis influence is weighted properly
+    weights = 1 / (np.square(distances) + 0.1)  # Avoid division by zero
+
     initial_guess = np.mean(sensors, axis=0)
 
     try:
-        result = least_squares(residuals, initial_guess, args=(sensors, distances))
-        print(f"✅ Trilateration Result: {result.x}")
-        return result.x
+        result = least_squares(residuals, initial_guess, args=(sensors, distances, weights))
+        estimated_position = result.x
+
+        # Fix: Ensure estimated Z value is within bounds
+        estimated_position[2] = max(0, min(estimated_position[2], 6))  # Z should be between 0-3 meters
+
+        print(f"✅ Trilateration Result: {estimated_position}")
+        return estimated_position
     except Exception as e:
         print(f"❌ Trilateration Error: {e}")
         return None
 
 def get_live_position():
-    global rssi_data, model, label_encoder, sensor_macs
+    global rssi_data, model, sensor_macs
 
     if not rssi_data:
         print("⚠️ No RSSI data available.")
         return None
 
-    persistent_id = next((pid for pid in rssi_data.keys() if len(rssi_data[pid]) >= 3), None)
-    if not persistent_id:
-        print("⚠️ No valid persistent_id with sufficient RSSI readings.")
+    persistent_id = global_state.get("persistent_id")
+    if not persistent_id or persistent_id not in rssi_data:
+        print(f"⚠️ Persistent ID {persistent_id} not recognized in RSSI data.")
         return None
 
-    print(f"🟢 Computing position for {persistent_id} using {len(rssi_data[persistent_id])} RSSI readings...")
+    print(f"📡 Fetching RSSI data for {persistent_id}: {rssi_data[persistent_id]}")
 
-    # **🔍 Print RSSI Values to Ensure They Update**
-    for mac, rssi in rssi_data[persistent_id].items():
-        print(f"📡 {mac} → RSSI: {rssi}")
-
-    # **2️⃣ Check ML Model**
-    if model is None:
+    # **Always use the same sensor MACs from the trained model**
+    if model is None or not sensor_macs:
         print("⚠️ No trained ML model available. Retraining now...")
         train_ml_model()
 
-    if model is not None and sensor_macs is not None:
-        print("✅ Using trained ML model.")
+    if model is None or not sensor_macs:
+        print("❌ No valid model available. Skipping prediction.")
+        return None
 
-        rssi_values = [rssi_data[persistent_id].get(mac, -100) for mac in sensor_macs]
+    # **Build RSSI vector with consistent sensor order**
+    rssi_values = np.array([rssi_data[persistent_id].get(mac, -100) for mac in sensor_macs])
 
-        try:
-            encoded_device = label_encoder.transform([persistent_id])[0]
-        except ValueError:
-            print(f"⚠️ Persistent ID {persistent_id} not recognized. Falling back to 'generic' category.")
-            encoded_device = label_encoder.transform(["generic"])[0]
+    if len(rssi_values) != len(sensor_macs):
+        print(f"❌ Feature shape mismatch: Expected {len(sensor_macs)}, Got {len(rssi_values)}")
+        return None
 
-        input_vector = np.append(rssi_values, encoded_device).reshape(1, -1)
-        predicted_position = model.predict(input_vector)[0]
+    print(f"🧐 RSSI Vector for ML Model: {rssi_values}")
 
+    try:
+        predicted_position = model.predict(rssi_values.reshape(1, -1))[0]
         print(f"🔍 ML Predicted Position for {persistent_id} → {predicted_position}")
         return predicted_position
+    except Exception as e:
+        print(f"❌ Error during prediction: {e}")
+        return None
 
-    # **3️⃣ Last Resort: Trilateration**
-    print("❌ ML Model failed. Falling back to trilateration.")
-    sensors = []
-    distances = []
+def store_training_data(persistent_id, mac_address, estimated_position=None, rssi_snapshot=None):
+    """Store RSSI-based training data in SQLite for future ML training."""
 
-    for mac, distance in rssi_data[persistent_id].items():
-        if mac in sensor_data:
-            sensors.append(sensor_data[mac]["position"])
-            distances.append(distance)
+    if rssi_snapshot is None:
+        rssi_snapshot = rssi_data.get(persistent_id, {})
 
-    if len(sensors) >= 3:
-        sensors = np.array(sensors)
-        distances = np.array(distances)
-        trilaterated_position = trilaterate(sensors, distances)
+    valid_rssi_readings = {k: v for k, v in rssi_snapshot.items() if v != -100}
+    if len(valid_rssi_readings) < 3:
+        print(f"⚠️ Not enough valid RSSI readings for {persistent_id}. Skipping storage.")
+        return
 
-        print(f"📍 Trilateration Position: {trilaterated_position}")
-        return trilaterated_position
+    # Extract last octet of beacon MAC and generate its expected sensor MAC
+    octets = mac_address.split(":")
+    last_octet = int(octets[-1], 16)
+    expected_sensor_mac = ":".join(octets[:-1] + [f"{(last_octet - 2) % 256:02x}"])
 
-    print("❌ Not enough valid sensor readings for any estimation.")
-    return None
+    if global_state["training_mode"] and persistent_id == global_state["persistent_id"]:
+        estimated_position = global_state["actual_position"]
+        weight = 3  # training sample
+    elif expected_sensor_mac in sensor_data:
+        estimated_position = sensor_data[expected_sensor_mac]["position"]
+        weight = 2  # sensor-based reading
+    else:
+        return
 
-def store_training_data(persistent_id, mac_address, estimated_position):
-    """Stores estimated positions for ML training dynamically."""
     conn = sqlite3.connect("training_data.db")
     cursor = conn.cursor()
 
-    inserted_count = 0  # Count how many records are inserted
+    rssi_json = json.dumps(valid_rssi_readings)
+    try:
+        x, y, z = map(float, estimated_position)
+    except Exception as e:
+        print(f"❌ Error converting position to float for {persistent_id}: {estimated_position}")
+        return
 
-    for sensor_mac, rssi in rssi_data.get(persistent_id, {}).items():
-        if rssi is None or not isinstance(rssi, (int, float)):
-            print(f"⚠️ Skipping sensor {sensor_mac} due to invalid RSSI value: {rssi}")
-            continue  # Skip bad data
+    if not np.isfinite(x) or not np.isfinite(y) or not np.isfinite(z):
+        print(f"❌ Invalid position detected: x={x}, y={y}, z={z}. Skipping.")
+        conn.close()
+        return
 
-        print(f"✅ Storing training data: Persistent ID={persistent_id}, Sensor={sensor_mac}, RSSI={rssi}, Position={estimated_position}")
+    if global_state["training_mode"] or expected_sensor_mac in sensor_data:
+        try:
+            cursor.execute("""
+            INSERT INTO training_data (persistent_id, mac_address, rssi_json, x, y, z, weight, position_available)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (persistent_id, mac_address, rssi_json, x, y, z, 3, 1))
 
-        cursor.execute("""
-            INSERT INTO training_data (persistent_id, mac_address, sensor_mac, rssi, x, y, z)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (persistent_id, mac_address, sensor_mac, float(rssi), estimated_position[0], estimated_position[1], estimated_position[2]))
+            conn.commit()
+            print(f"✅ Training data stored for {persistent_id} (x={x}, y={y}, z={z})")
 
-        inserted_count += 1  # Count successful insertions
+        except sqlite3.Error as e:
+            print(f"❌ SQLite Error: {e}")
+        finally:
+            conn.close()
+
+#    downsample_database()
+    train_ml_model()
+
+def store_sensor_positions():
+    """Store the known sensor positions in the database for reference."""
+    conn = sqlite3.connect("training_data.db")
+    cursor = conn.cursor()
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS sensor_positions (
+        mac_address TEXT PRIMARY KEY,
+        x FLOAT NOT NULL,
+        y FLOAT NOT NULL,
+        z FLOAT NOT NULL
+    );
+    """)
+
+    for mac, data in sensor_data.items():
+        x, y, z = data["position"]
+        try:
+            cursor.execute("""
+            INSERT OR REPLACE INTO sensor_positions (mac_address, x, y, z)
+            VALUES (?, ?, ?, ?)
+            """, (mac, x, y, z))
+        except sqlite3.Error as e:
+            print(f"❌ SQLite Error storing sensor positions: {e}")
 
     conn.commit()
     conn.close()
 
-    if inserted_count == 0:
-        print("⚠️ No training data was inserted! Check if RSSI data exists.")
-    else:
-        print(f"✅ Successfully stored {inserted_count} new training samples!")
+def smooth_rssi(persistent_id, sensor_mac, new_rssi, alpha=0.2):
+    """Applies exponential smoothing to reduce RSSI fluctuations."""
+    if persistent_id not in rssi_data:
+        rssi_data[persistent_id] = {}
 
-    print("\n🔄 Retraining ML Model with Updated Data...")
-    train_ml_model()  # ✅ Force re-training immediately
+    if sensor_mac in rssi_data[persistent_id]:
+        previous_rssi = rssi_data[persistent_id][sensor_mac]
+        smoothed_rssi = alpha * new_rssi + (1 - alpha) * previous_rssi  # Exponential smoothing formula
+    else:
+        smoothed_rssi = new_rssi  # No previous value, use new RSSI
+
+    return smoothed_rssi
 
 def on_message(client, userdata, msg):
-    global rssi_data
     try:
-        payload = json.loads(msg.payload.decode())
-        topic_parts = msg.topic.split("/")
+        payload_str = msg.payload.decode(errors='ignore')
+        payload = json.loads(payload_str)
 
-        if len(topic_parts) < 5:
-            print(f"Skipping malformed topic: {msg.topic}")
+        persistent_id = payload.get("persistent_id", payload.get("device", None))
+        if not persistent_id:
+            print(f"⚠️ Missing persistent_id! Skipping message.")
             return
 
-        sensor_mac = topic_parts[3].lower()
-        distance = payload.get("distance")
+        beacon_mac = payload.get("device", "").lower()
+        scanner_mac = payload.get("scanner", "").split(" ")[-1].strip("()").lower()
+        new_rssi = payload.get("rssi")
 
-        if distance is None or not isinstance(distance, (int, float)):  # ✅ Ignore invalid RSSI values
-            print(f"⚠️ Received invalid RSSI value: {distance}. Skipping update.")
+        if new_rssi is None or not isinstance(new_rssi, (int, float)):
+            print(f"⚠️ Invalid RSSI value: {new_rssi}. Skipping.")
             return
 
-        persistent_id = payload.get("persistent_id")
-        mac_address = payload.get("device")
+        print(f"📩 New RSSI: PersistentID={persistent_id}, Scanner={scanner_mac}, RSSI={new_rssi}")  # Debugging
 
-        if persistent_id is None:
-            print(f"⚠️ Warning: persistent_id is missing! Using mac_address ({mac_address}) as fallback.")
-            persistent_id = mac_address
+        smoothed_rssi = smooth_rssi(persistent_id, scanner_mac, new_rssi)
+        rssi_data.setdefault(persistent_id, {})[scanner_mac] = smoothed_rssi
 
-        if sensor_mac in sensor_data:
-            sensor_name = sensor_data[sensor_mac]["name"]
+        print(f"📊 Updated RSSI Data: {rssi_data[persistent_id]}")  # Debugging
 
-            if persistent_id not in rssi_data:
-                rssi_data[persistent_id] = {}
-
-            rssi_data[persistent_id][sensor_mac] = distance  # ✅ Store only valid RSSI values
-            print(f"Updated rssi_data: {persistent_id} ({sensor_name}) -> {distance}m")
-
-            # Ensure we have enough valid readings
-            if len(rssi_data[persistent_id]) >= 3:
-                print("🟢 We have at least 3 RSSI readings, calling get_live_position() now...")
-                estimated_position = get_live_position()
-
-                if estimated_position is not None:
-                    print(f"🔴 New estimated position: {estimated_position}")
-
-                # If we are in training mode, have not yet stored data, and have an actual position, do so now:
-                if (global_state.get("training_mode")
-                    and not global_state.get("training_data_stored")
-                    and "actual_position" in global_state):
-                    print(f"📝 Training mode: Storing actual position {global_state['actual_position']} "
-                          f"for persistent_id={persistent_id}")
-
-                    store_training_data(
-                        persistent_id,
-                        mac_address,
-                        global_state["actual_position"]
-                    )
-
-                    global_state["training_data_stored"] = True
-                    print("✅ Done storing training data!")
-
-        else:
-            print(f"⚠️ Received RSSI but sensor {sensor_mac} not in known sensors list.")
+        # **Process Data**
+        estimated_position = get_live_position()
+        store_training_data(persistent_id, beacon_mac, estimated_position, rssi_snapshot=rssi_data.get(persistent_id))
 
     except Exception as e:
-        print(f"Error processing MQTT message: {e}")
+        print(f"❌ MQTT Error: {e}")
+
+def downsample_database():
+    """Keeps the database size manageable by removing older data."""
+    conn = sqlite3.connect("training_data.db")
+    cursor = conn.cursor()
+
+    # Determine number of rows
+    cursor.execute("SELECT COUNT(*) FROM training_data")
+    total_rows = cursor.fetchone()[0]
+
+    # Keep only the latest 10,000 records
+    max_rows = 10000
+    if total_rows > max_rows:
+        delete_rows = total_rows - max_rows
+        print(f"🗑️ Downsampling: Removing {delete_rows} old records...")
+        cursor.execute("""
+            DELETE FROM training_data WHERE id IN (
+                SELECT id FROM training_data ORDER BY timestamp ASC LIMIT ?
+            )
+        """, (delete_rows,))
+        conn.commit()
+
+    conn.close()
 
 # **MQTT Authentication & Connection**
 def connect_mqtt():
@@ -313,11 +501,13 @@ def connect_mqtt():
     return client
 
 # Start MQTT Listener
-def start_mqtt_listener(persistent_id):
+def start_mqtt_listener(update_interval=2):
+    """Start MQTT listener and periodically fetch live position."""
     client = connect_mqtt()
-    topic = f"bermuda/{persistent_id}/scanner/+/rssi"
+    topic = f"bermuda/+/scanner/+/rssi"
     client.subscribe(topic)
     print(f"Subscribed to {topic}")
+
     client.loop_start()
 
     while True:
@@ -385,37 +575,6 @@ def find_room(estimated_position):
 
     return "Unknown Room"
 
-def plot_live_trilateration(mac_address):
-    plt.ion()  # Enable interactive mode
-    fig = plt.figure()
-    ax = fig.add_subplot(111, projection='3d')
-
-    while True:
-        if len(rssi_data) >= 3:
-            sensors, distances = zip(*[(sensor_data[mac]["position"], dist) for mac, dist in rssi_data.items() if mac in sensor_data])
-            estimated_position = trilaterate(np.array(sensors), np.array(distances))
-
-            ax.clear()
-            ax.set_xlabel('X Axis')
-            ax.set_ylabel('Y Axis')
-            ax.set_zlabel('Z Axis')
-
-            # Plot sensors
-            for mac, info in sensor_data.items():
-                pos = info["position"]
-                ax.scatter(*pos, c='blue', marker='o', s=80, label=info["name"] if mac == list(sensor_data.keys())[0] else "")
-                ax.text(pos[0], pos[1], pos[2], info["name"], color='black', fontsize=8)
-
-            # Plot estimated position
-            ax.scatter(*estimated_position, c='red', marker='x', s=100, label="Estimated Position")
-            ax.text(estimated_position[0], estimated_position[1], estimated_position[2], f"{mac_address}", color='red', fontsize=10)
-
-            plt.legend()
-            plt.draw()
-            plt.pause(2)  # Refresh every 2 seconds
-
-        time.sleep(1)  # Wait before updating
-
 # Visualization function
 def plot_3d_position(sensors, estimated_position):
     plt.ion()  # Enable interactive mode for live updates
@@ -429,7 +588,7 @@ def plot_3d_position(sensors, estimated_position):
         ax.clear()  # Clear previous frame
 
         # **Get live estimated position from MQTT**
-        print("🟢 Calling get_live_position() to fetch latest estimated position...")
+#        print("🟢 Calling get_live_position() to fetch latest estimated position...")
         estimated_position = get_live_position()  # Function to retrieve latest calculated position
 
         if estimated_position is None:
@@ -520,7 +679,7 @@ def get_device_position(yaml_file, sensor_data, mac_address):
     mac_address = mac_address.lower()  # Normalize input MAC address
 
     if mac_address not in data:
-        print(f"MAC address {mac_address} not found in dataset.")
+#        print(f"MAC address {mac_address} not found in dataset.")
         return None
 
     device_data = data[mac_address].get('scanners', {})
@@ -536,7 +695,7 @@ def get_device_position(yaml_file, sensor_data, mac_address):
             sensor_names.append(sensor_data[source_address]["name"])
 
     if len(readings) < 3:
-        print(f"Not enough valid sensor readings for MAC {mac_address} to perform trilateration.")
+#        print(f"Not enough valid sensor readings for MAC {mac_address} to perform trilateration.")
         return None
 
     sensors, distances = zip(*readings)
@@ -561,7 +720,7 @@ if __name__ == "__main__":
         global_state["actual_position"] = tuple(args.train)
 
     # Start MQTT listener in a separate thread
-    mqtt_thread = threading.Thread(target=start_mqtt_listener, args=(args.persistent_id,))
+    mqtt_thread = threading.Thread(target=start_mqtt_listener,)
     mqtt_thread.daemon = True
     mqtt_thread.start()
 
