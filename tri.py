@@ -37,6 +37,7 @@ MODEL_FILE = "ml_model.pkl"
 model = None
 label_encoder = None
 sensor_macs = []
+new_readings_count = 0
 
 # Load YAML file
 def load_yaml(file_path):
@@ -219,7 +220,7 @@ def train_ml_model():
             continue
 
         features.append(row_rssi)
-        labels.append([x, y, z])
+        labels.append(pos)
         weights.append(weight)
 
     conn.close()
@@ -311,7 +312,7 @@ def get_live_position():
         print(f"⚠️ Persistent ID {persistent_id} not recognized in RSSI data.")
         return None
 
-    print(f"📡 Fetching RSSI data for {persistent_id}: {rssi_data[persistent_id]}")
+#    print(f"📡 Fetching RSSI data for {persistent_id}: {rssi_data[persistent_id]}")
 
     # **Always use the same sensor MACs from the trained model**
     if model is None or not sensor_macs:
@@ -329,7 +330,7 @@ def get_live_position():
         print(f"❌ Feature shape mismatch: Expected {len(sensor_macs)}, Got {len(rssi_values)}")
         return None
 
-    print(f"🧐 RSSI Vector for ML Model: {rssi_values}")
+#    print(f"🧐 RSSI Vector for ML Model: {rssi_values}")
 
     try:
         predicted_position = model.predict(rssi_values.reshape(1, -1))[0]
@@ -341,13 +342,14 @@ def get_live_position():
 
 def store_training_data(persistent_id, mac_address, estimated_position=None, rssi_snapshot=None):
     """Store RSSI-based training data in SQLite for future ML training."""
+    global new_readings_count
 
     if rssi_snapshot is None:
         rssi_snapshot = rssi_data.get(persistent_id, {})
 
     valid_rssi_readings = {k: v for k, v in rssi_snapshot.items() if v != -100}
     if len(valid_rssi_readings) < 3:
-        print(f"⚠️ Not enough valid RSSI readings for {persistent_id}. Skipping storage.")
+#        print(f"⚠️ Not enough valid RSSI readings for {persistent_id}. Skipping storage.")
         return
 
     # Extract last octet of beacon MAC and generate its expected sensor MAC
@@ -363,6 +365,12 @@ def store_training_data(persistent_id, mac_address, estimated_position=None, rss
         weight = 2  # sensor-based reading
     else:
         return
+
+    new_readings_count += 1
+    if new_readings_count >= 100:
+        print("🔄 Retraining model after 1000 new readings.")
+        train_ml_model()
+        new_readings_count = 0
 
     conn = sqlite3.connect("training_data.db")
     cursor = conn.cursor()
@@ -393,9 +401,6 @@ def store_training_data(persistent_id, mac_address, estimated_position=None, rss
             print(f"❌ SQLite Error: {e}")
         finally:
             conn.close()
-
-#    downsample_database()
-    train_ml_model()
 
 def store_sensor_positions():
     """Store the known sensor positions in the database for reference."""
@@ -438,6 +443,7 @@ def smooth_rssi(persistent_id, sensor_mac, new_rssi, alpha=0.2):
     return smoothed_rssi
 
 def on_message(client, userdata, msg):
+    global new_readings_count
     try:
         payload_str = msg.payload.decode(errors='ignore')
         payload = json.loads(payload_str)
@@ -455,12 +461,12 @@ def on_message(client, userdata, msg):
             print(f"⚠️ Invalid RSSI value: {new_rssi}. Skipping.")
             return
 
-        print(f"📩 New RSSI: PersistentID={persistent_id}, Scanner={scanner_mac}, RSSI={new_rssi}")  # Debugging
+#        print(f"📩 New RSSI: PersistentID={persistent_id}, Scanner={scanner_mac}, RSSI={new_rssi}")  # Debugging
 
         smoothed_rssi = smooth_rssi(persistent_id, scanner_mac, new_rssi)
         rssi_data.setdefault(persistent_id, {})[scanner_mac] = smoothed_rssi
 
-        print(f"📊 Updated RSSI Data: {rssi_data[persistent_id]}")  # Debugging
+#        print(f"📊 Updated RSSI Data: {rssi_data[persistent_id]}")  # Debugging
 
         # **Process Data**
         estimated_position = get_live_position()
