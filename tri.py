@@ -2,6 +2,7 @@ import yaml
 import sqlite3
 import json
 import pickle
+from shapely.geometry import LineString, Polygon
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import LabelEncoder
 from xgboost import XGBRegressor
@@ -162,6 +163,99 @@ def validate_rssi_data(persistent_id, rssi_json):
 
 import numpy as np
 
+# 1) Add a line_intersects_wall function or something similar
+def line_intersects_wall_3d(sensor_pos, device_pos, wall):
+    """
+    Checks if the line segment from sensor_pos to device_pos intersects
+    an axis-aligned rectangular prism described by wall["corners"] in 3D.
+
+    sensor_pos, device_pos: (x, y, z)
+    wall["corners"]: [ (x_min, y_min, z_min), (x_max, y_max, z_max) ]
+                     Must be axis-aligned (no rotations).
+    Returns True if the line segment intersects the box.
+    """
+
+    (sx, sy, sz) = sensor_pos
+    (dx, dy, dz) = device_pos
+
+    # Unpack wall corners
+    c1, c2 = wall["corners"]
+    x_min, y_min, z_min = (min(c1[0], c2[0]),
+                           min(c1[1], c2[1]),
+                           min(c1[2], c2[2]))
+    x_max, y_max, z_max = (max(c1[0], c2[0]),
+                           max(c1[1], c2[1]),
+                           max(c1[2], c2[2]))
+
+    # Parametric line: P(t) = sensor_pos + t*(device_pos - sensor_pos)
+    # We only care about t in [0, 1] => segment, not infinite ray
+    # We'll compute entry/exit in each axis using "slab" intersection
+    # If there's an overlap in t ranges across x, y, z, => intersection.
+
+    # direction
+    dx_line = dx - sx
+    dy_line = dy - sy
+    dz_line = dz - sz
+
+    # For each axis, we solve for t:
+    #   x_min <= sx + t*dx_line <= x_max, and similarly for y, z.
+    # We'll keep track of (t_enter, t_exit) across all 3 axes and see if t_enter <= t_exit
+
+    t_min = 0.0
+    t_max = 1.0  # param range for the segment
+
+    def update_slab(p, d, min_b, max_b, t0, t1):
+        # If d == 0, line is parallel to that axis. Check if p is inside slab
+        if abs(d) < 1e-9:
+            # if outside min_b..max_b => no intersection
+            if p < min_b or p > max_b:
+                return None, None  # no intersection
+            return t0, t1  # no change
+        else:
+            # param t where line hits min_b => (min_b - p)/d
+            t_enter = (min_b - p) / d
+            # param t where line hits max_b
+            t_exit  = (max_b - p) / d
+            if t_enter > t_exit:
+                t_enter, t_exit = t_exit, t_enter
+            # shrink the [t0, t1] range
+            if t_exit < t0 or t_enter > t1:
+                return None, None  # no overlap => no intersection
+            # update range
+            new_t0 = max(t0, t_enter)
+            new_t1 = min(t1, t_exit)
+            return new_t0, new_t1
+
+    # X axis
+    t_min, t_max = update_slab(sx, dx_line, x_min, x_max, t_min, t_max)
+    if t_min is None:  # no intersection
+        return False
+
+    # Y axis
+    t_min, t_max = update_slab(sy, dy_line, y_min, y_max, t_min, t_max)
+    if t_min is None:
+        return False
+
+    # Z axis
+    t_min, t_max = update_slab(sz, dz_line, z_min, z_max, t_min, t_max)
+    if t_min is None:
+        return False
+
+    # if t_min <= t_max, there's an intersection. We must check that t_min <= 1 and t_max >= 0
+    if t_max < 0 or t_min > 1:
+        return False
+
+    # There's overlap within the param range => intersection with the segment
+    return True
+
+# 2) A function to compute total wall penalty
+def total_wall_penalty(sensor_pos, device_pos, walls):
+    penalty_sum = 0.0
+    for w in walls:
+        if line_intersects_wall_3d(sensor_pos, device_pos, w):
+            penalty_sum += w["impedance_db"]
+    return penalty_sum
+
 def train_ml_model():
     global model, label_encoder, sensor_macs
 
@@ -219,7 +313,19 @@ def train_ml_model():
             print(f"⚠️ Skipping {persistent_id}: Invalid position values (x={x}, y={y}, z={z})")
             continue
 
-        features.append(row_rssi)
+        # 3) Compute additional wall feature(s)
+        # For each sensor, see if sensor->device crosses a wall, sum them all
+        total_penalty = 0.0
+        for i, smac in enumerate(sensor_macs):
+            s_pos = sensor_data[smac]["position"]
+            # pos is the device position (x,y,z)
+            total_penalty += total_wall_penalty(s_pos, pos, walls)
+
+        # Build 'row_with_wall' by adding the total_penalty as a new dimension
+        row_with_wall = np.concatenate([row_rssi, [total_penalty]])
+
+        # Now append row_with_wall (NOT row_rssi)
+        features.append(row_with_wall)
         labels.append(pos)
         weights.append(weight)
 
@@ -326,6 +432,26 @@ def get_live_position():
     # **Build RSSI vector with consistent sensor order**
     rssi_values = np.array([rssi_data[persistent_id].get(mac, -100) for mac in sensor_macs])
 
+    total_penalty = 0.0
+    for smac in sensor_macs:
+        s_pos = sensor_data[smac]["position"]
+        # You might not have a known device position at this point, so you can:
+        # (a) do a dummy approach: e.g., no penalty => 0
+        # (b) or iterative approach if you want "on-the-fly" path-loss.
+        # For now, let's keep it simple:
+        pass
+
+    # Next, compute or approximate the same penalty dimension
+    total_penalty = 0.0
+    # If you want a real on-the-fly penalty, you'd do:
+    # for smac in sensor_macs:
+    #     total_penalty += total_wall_penalty(sensor_data[smac]["position"], ???, walls)
+    # But for now we keep it at 0.0 or a placeholder
+
+    rssi_with_penalty = np.concatenate([rssi_values, [total_penalty]])
+
+    # Finally call predict:
+
     if len(rssi_values) != len(sensor_macs):
         print(f"❌ Feature shape mismatch: Expected {len(sensor_macs)}, Got {len(rssi_values)}")
         return None
@@ -333,7 +459,7 @@ def get_live_position():
 #    print(f"🧐 RSSI Vector for ML Model: {rssi_values}")
 
     try:
-        predicted_position = model.predict(rssi_values.reshape(1, -1))[0]
+        predicted_position = model.predict(rssi_with_penalty.reshape(1, -1))[0]
         print(f"🔍 ML Predicted Position for {persistent_id} → {predicted_position}")
         return predicted_position
     except Exception as e:
@@ -541,6 +667,20 @@ room_data = [
     {"name": "Bathroom", "floor": 1, "corners": [(8.3, 3.3), (8.3, 6.34), (10.1, 6.34), (10.1, 3.3)]},
 ]
 
+# In your config or near sensor_data
+walls = [
+    {
+      "corners": [(2.0, 2.0, 0.0), (2.0, 5.0, 0.0)],  # 2D line extended in z, or a small 3D block
+      "thickness": 0.25,
+      "impedance_db": 6.0
+    },
+    {
+      "corners": [(5.0, 1.0, 0.0), (7.0, 2.0, 0.0)],
+      "thickness": 0.3,
+      "impedance_db": 9.0
+    }
+]
+
 rssi_data = {}
 sensor_data = {
     "1c:69:20:cc:f2:c4": {"name": "Kitchen Sensor", "position": (0, 0, 1)},
@@ -580,6 +720,13 @@ def find_room(estimated_position):
                 return room["name"]
 
     return "Unknown Room"
+
+def path_loss_with_walls(sensor_pos, device_pos, base_pathloss):
+    wall_losses = 0.0
+    for w in walls:
+        if line_intersects_wall_3d(sensor_pos, device_pos, w):  # <-- updated
+            wall_losses += w["impedance_db"]
+    return base_pathloss + wall_losses
 
 # Visualization function
 def plot_3d_position(sensors, estimated_position):
@@ -633,6 +780,18 @@ def plot_3d_position(sensors, estimated_position):
                 ceiling_surface = Poly3DCollection([ceiling_corners], color='gray', alpha=0.0, label="Ceiling")
                 ax.add_collection3d(ceiling_surface)
 
+        for wall in walls:
+            (x1, y1, z1), (x2, y2, z2) = wall["corners"]
+            # For a thin vertical wall, you could “extrude” in Z or thickness:
+            # Build a small rectangle or polygon representing the wall’s footprint
+            # Then plot with a Poly3DCollection or line, e.g.:
+            wall_polygon_corners = [
+                (x1, y1, z1),
+                (x2, y2, z2),
+                (x2, y2, z2 + 2.5),  # approximate height
+                (x1, y1, z1 + 2.5),
+            ]
+
         # **Draw rooms as flat surfaces with custom shapes**
         for room in room_data:
             floor_z = floor_heights[room["floor"]]
@@ -657,6 +816,30 @@ def plot_3d_position(sensors, estimated_position):
             name = data["name"]
             ax.scatter(*pos, c='blue', marker='o', s=80, label="Sensor" if mac == list(sensor_data.keys())[0] else "")
             ax.text(pos[0], pos[1], pos[2], name, color='black', fontsize=8)
+
+        # Now draw dotted lines from each sensor to the device, with an RSSI label
+        # (assuming we can fetch the persistent_id and find the rssi_data from get_live_position)
+        persistent_id = global_state.get("persistent_id")
+        if estimated_position is not None and persistent_id in rssi_data:
+            for mac, data in sensor_data.items():
+                sensor_pos = data["position"]
+                if mac in rssi_data[persistent_id]:
+                    # e.g.  -50 dBm
+                    rssi_val = rssi_data[persistent_id][mac]
+                else:
+                    rssi_val = -100  # default or unknown
+
+                # Plot dotted line from sensor_pos -> estimated_position
+                ax.plot([sensor_pos[0], estimated_position[0]],
+                        [sensor_pos[1], estimated_position[1]],
+                        [sensor_pos[2], estimated_position[2]],
+                        linestyle='dotted', color='green')
+
+                # Place an RSSI text near the midpoint
+                midx = (sensor_pos[0] + estimated_position[0]) / 2.0
+                midy = (sensor_pos[1] + estimated_position[1]) / 2.0
+                midz = (sensor_pos[2] + estimated_position[2]) / 2.0
+                ax.text(midx, midy, midz, f'RSSI: {rssi_val:.1f} dBm', color='green', fontsize=8)
 
         # **Plot estimated position**
         if estimated_position is not None:
