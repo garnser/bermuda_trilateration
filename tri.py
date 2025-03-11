@@ -2,10 +2,8 @@ import yaml
 import sqlite3
 import json
 import pickle
-from shapely.geometry import LineString, Polygon
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import LabelEncoder
-from xgboost import XGBRegressor
 import numpy as np
 import argparse
 import matplotlib.pyplot as plt
@@ -34,11 +32,10 @@ global_state = {
 }
 
 MODEL_FILE = "ml_model.pkl"
+model_lock = threading.Lock()
 
 model = None
 label_encoder = None
-sensor_macs = []
-new_readings_count = 0
 
 # Load YAML file
 def load_yaml(file_path):
@@ -47,317 +44,111 @@ def load_yaml(file_path):
     return {k.lower(): v for k, v in data.items()}  # Normalize MAC addresses to lowercase
 
 def init_database():
-    """Initialize SQLite database and ensure all necessary columns exist."""
+    """Initialize SQLite database for ML training."""
     conn = sqlite3.connect("training_data.db")
     cursor = conn.cursor()
-
-    # **Create training_data table (if not exists)**
     cursor.execute("""
-    CREATE TABLE IF NOT EXISTS training_data (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        persistent_id TEXT NOT NULL,
-        mac_address TEXT,
-        rssi_json TEXT,  -- Stores multiple RSSI readings as JSON
-        x FLOAT DEFAULT NULL,
-        y FLOAT DEFAULT NULL,
-        z FLOAT DEFAULT NULL,
-        weight INTEGER DEFAULT 3,  -- Default weight for training data
-        position_available INTEGER DEFAULT 1,  -- 1 if (x, y, z) exists, 0 if RSSI-only
-        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
+        CREATE TABLE IF NOT EXISTS training_data (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            persistent_id TEXT NOT NULL,
+            mac_address TEXT,
+            sensor_mac TEXT,
+            rssi FLOAT,
+            x FLOAT,
+            y FLOAT,
+            z FLOAT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
     """)
-
-    # **Create sensor_positions table (if not exists)**
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS sensor_positions (
-        mac_address TEXT PRIMARY KEY,
-        x FLOAT NOT NULL,
-        y FLOAT NOT NULL,
-        z FLOAT NOT NULL
-    );
-    """)
-
     conn.commit()
     conn.close()
 
-def load_config(file_path="config.yaml"):
-    """Loads sensor data, room data, and floor boundaries from YAML config."""
-    with open(file_path, "r") as file:
-        config = yaml.safe_load(file)
-
-    # Convert sensor positions from lists to tuples
-    config["sensors"] = {mac.lower(): {"name": sensor["name"], "position": tuple(sensor["position"])}
-                         for mac, sensor in config["sensors"].items()}
-
-#    print("Loaded sensor_data:", json.dumps(config["sensors"], indent=4))
-
-    # Convert floor boundaries to NumPy arrays
-    config["floor_boundaries"] = {int(k): np.array(v) for k, v in config["floor_boundaries"].items()}
-
-    return config
-
-# Load configuration at startup
-#config = load_config()
-
-#sensor_data = config["sensors"]
-#room_data = config["rooms"]
-#floor_boundaries = config["floor_boundaries"]
-
 def load_ml_model():
     global model, sensor_macs, label_encoder
-    sensor_macs = []  # Default empty list
-
     try:
         with open(MODEL_FILE, "rb") as f:
-            model, loaded_sensor_macs, label_encoder = pickle.load(f)
-            sensor_macs = loaded_sensor_macs if loaded_sensor_macs else list(sensor_data.keys())
-
-#        print(f"✅ Loaded ML model from {MODEL_FILE}")
+            model, sensor_macs, label_encoder = pickle.load(f)
+        print(f"✅ Loaded ML model from {MODEL_FILE}")
     except FileNotFoundError:
-        print("⚠️ No saved ML model found. Loading sensor MACs from sensor_data...")
-        sensor_macs = list(sensor_data.keys())
-        model = None
-    except Exception as e:
-        print(f"❌ Error loading ML model: {e}")
-        model = None
+        print("⚠️ No saved ML model found. Model will be trained when needed.")
 
-def fetch_sensor_macs_from_db():
-    """Fetch distinct sensor MAC addresses from the database."""
-    conn = sqlite3.connect("training_data.db")
-    cursor = conn.cursor()
-
-    cursor.execute("SELECT DISTINCT mac_address FROM training_data")
-    macs = [row[0] for row in cursor.fetchall()]
-
-    conn.close()
-
-#    print(f"✅ Loaded {len(macs)} sensor MACs from database.")
-    return macs
-
-def validate_rssi_data(persistent_id, rssi_json):
-    """Ensure we have enough valid RSSI readings for training or prediction."""
-    if not rssi_json:
-        print(f"⚠️ Skipping {persistent_id}: No RSSI data found in the database!")
-        return False
-
-#    print(f"📊 Validating RSSI data for {persistent_id}: {rssi_json}")
-
-    rssi_dict = json.loads(rssi_json)
-    valid_rssi_values = [rssi for rssi in rssi_dict.values() if rssi > -100]  # Ignore -100 values
-
-    if len(valid_rssi_values) < 3:
-#        print(f"⚠️ Skipping {persistent_id}: Too few RSSI readings available ({len(valid_rssi_values)} found, need at least 3).")
-        return False
-
-#    print(f"📊 Parsed RSSI dictionary: {rssi_dict}")
-
-    valid_rssi_values = [rssi for rssi in rssi_dict.values() if isinstance(rssi, (int, float)) and rssi > -100]
-
-#    print(f"✅ {persistent_id} has {len(valid_rssi_values)} valid RSSI readings.")
-
-    if all(rssi == -100 for rssi in rssi_dict.values()):
-        print(f"⚠️ Skipping {persistent_id}: All RSSI values are invalid (-100 readings).")
-        return False
-
-    return True
-
-import numpy as np
-
-# 1) Add a line_intersects_wall function or something similar
-def line_intersects_wall_3d(sensor_pos, device_pos, wall):
+def rssi_to_distance(rssi, tx_power=-70, n=2.0):
     """
-    Checks if the line segment from sensor_pos to device_pos intersects
-    an axis-aligned rectangular prism described by wall["corners"] in 3D.
-
-    sensor_pos, device_pos: (x, y, z)
-    wall["corners"]: [ (x_min, y_min, z_min), (x_max, y_max, z_max) ]
-                     Must be axis-aligned (no rotations).
-    Returns True if the line segment intersects the box.
+    Convert RSSI to distance (in meters) using a simple path-loss model.
+    tx_power: RSSI at 1 meter (default: -59 dBm)
+    n: path-loss exponent (default: 2.0 for free space)
     """
-
-    (sx, sy, sz) = sensor_pos
-    (dx, dy, dz) = device_pos
-
-    # Unpack wall corners
-    c1, c2 = wall["corners"]
-    x_min, y_min, z_min = (min(c1[0], c2[0]),
-                           min(c1[1], c2[1]),
-                           min(c1[2], c2[2]))
-    x_max, y_max, z_max = (max(c1[0], c2[0]),
-                           max(c1[1], c2[1]),
-                           max(c1[2], c2[2]))
-
-    # Parametric line: P(t) = sensor_pos + t*(device_pos - sensor_pos)
-    # We only care about t in [0, 1] => segment, not infinite ray
-    # We'll compute entry/exit in each axis using "slab" intersection
-    # If there's an overlap in t ranges across x, y, z, => intersection.
-
-    # direction
-    dx_line = dx - sx
-    dy_line = dy - sy
-    dz_line = dz - sz
-
-    # For each axis, we solve for t:
-    #   x_min <= sx + t*dx_line <= x_max, and similarly for y, z.
-    # We'll keep track of (t_enter, t_exit) across all 3 axes and see if t_enter <= t_exit
-
-    t_min = 0.0
-    t_max = 1.0  # param range for the segment
-
-    def update_slab(p, d, min_b, max_b, t0, t1):
-        # If d == 0, line is parallel to that axis. Check if p is inside slab
-        if abs(d) < 1e-9:
-            # if outside min_b..max_b => no intersection
-            if p < min_b or p > max_b:
-                return None, None  # no intersection
-            return t0, t1  # no change
-        else:
-            # param t where line hits min_b => (min_b - p)/d
-            t_enter = (min_b - p) / d
-            # param t where line hits max_b
-            t_exit  = (max_b - p) / d
-            if t_enter > t_exit:
-                t_enter, t_exit = t_exit, t_enter
-            # shrink the [t0, t1] range
-            if t_exit < t0 or t_enter > t1:
-                return None, None  # no overlap => no intersection
-            # update range
-            new_t0 = max(t0, t_enter)
-            new_t1 = min(t1, t_exit)
-            return new_t0, new_t1
-
-    # X axis
-    t_min, t_max = update_slab(sx, dx_line, x_min, x_max, t_min, t_max)
-    if t_min is None:  # no intersection
-        return False
-
-    # Y axis
-    t_min, t_max = update_slab(sy, dy_line, y_min, y_max, t_min, t_max)
-    if t_min is None:
-        return False
-
-    # Z axis
-    t_min, t_max = update_slab(sz, dz_line, z_min, z_max, t_min, t_max)
-    if t_min is None:
-        return False
-
-    # if t_min <= t_max, there's an intersection. We must check that t_min <= 1 and t_max >= 0
-    if t_max < 0 or t_min > 1:
-        return False
-
-    # There's overlap within the param range => intersection with the segment
-    return True
-
-# 2) A function to compute total wall penalty
-def total_wall_penalty(sensor_pos, device_pos, walls):
-    penalty_sum = 0.0
-    for w in walls:
-        if line_intersects_wall_3d(sensor_pos, device_pos, w):
-            penalty_sum += w["impedance_db"]
-    return penalty_sum
+    return 10 ** ((tx_power - rssi) / (10 * n))
 
 def train_ml_model():
+    """Train a machine learning model using all available RSSI data from all devices."""
     global model, label_encoder, sensor_macs
+    with model_lock:
 
-    print("🔄 Starting ML model training...")
-    conn = sqlite3.connect("training_data.db")
-    cursor = conn.cursor()
-
-    # **Always reload sensor MACs from the database**
-    sensor_macs = list(sensor_data.keys())
-
-    if not sensor_macs:
-        print("❌ No sensor MACs found! Training aborted.")
-        return
-
-    cursor.execute("""
-        SELECT persistent_id, mac_address, rssi_json, x, y, z, weight
-        FROM training_data
-        WHERE position_available = 1 OR weight = 2
-    """)
-    data_batch = cursor.fetchall()
-
-    if not data_batch:
-        print("⚠️ No valid training data found. Skipping ML training.")
+        conn = sqlite3.connect("training_data.db")
+        cursor = conn.cursor()
+        cursor.execute("SELECT persistent_id, sensor_mac, rssi, x, y, z FROM training_data WHERE rssi IS NOT NULL")
+        data = cursor.fetchall()
         conn.close()
-        return
 
-    print(f"✅ Found {len(data_batch)} training samples.")
+        if len(data) < 3:
+            print("⚠️ Not enough valid training data available. Skipping training.")
+            # Optionally, you can initialize a basic label_encoder with just 'generic' to avoid errors later:
+            label_encoder = LabelEncoder()
+            label_encoder.fit(["generic"])
+            return None
 
-    features, labels, weights = [], [], []
+        sensor_macs = sorted(sensor_data.keys())
 
-    for persistent_id, mac_address, rssi_json_str, x, y, z, weight in data_batch:
-        if not validate_rssi_data(persistent_id, rssi_json_str):
-            continue
+        # Gather all persistent_ids
+        devices_in_data = [row[0] for row in data]
 
-        try:
-            rssi_dict = json.loads(rssi_json_str)
-        except Exception:
-            print(f"❌ JSON decoding error for {persistent_id}")
-            continue
+        # Build feature rows and labels
+        features = []
+        labels = []
+        for persistent_id, sensor_mac, rssi, x, y, z in data:
+            row_features = []
+            for mac in sensor_macs:
+                # Use the RSSI if available; otherwise default to -100
+                sensor_rssi = rssi if sensor_mac == mac else -100
+                # Retrieve the fixed sensor position from sensor_data
+                sensor_pos = sensor_data.get(mac, {}).get("position", (0,0,0))
+                # Append both the RSSI and sensor position as part of the feature
+                row_features.extend([sensor_rssi, sensor_pos[0], sensor_pos[1], sensor_pos[2]])
+            features.append(row_features)
+            labels.append([x, y, z])
 
-        # **Ensure RSSI vector uses the same sensors from the database**
-        row_rssi = np.array([rssi_dict.get(mac, np.nan) for mac in sensor_macs])  # Use NaN instead of -100
+        # Convert to numpy arrays
+        features = np.array(features)
+        labels = np.array(labels)
 
-        if np.all(np.logical_or(np.isnan(row_rssi), row_rssi == -100)):
-            continue
+        # 1️⃣ Always include "generic" in the label set
+        all_labels = set(devices_in_data)
+        all_labels.add("generic")
+        all_labels = sorted(all_labels)
 
-        # **Ensure position values are valid**
-        try:
-            pos = [float(x), float(y), float(z)]
-        except Exception as e:
-            print(f"❌ Skipping {persistent_id}: Could not convert position values to float: {x}, {y}, {z}")
-            continue
+        # 2️⃣ Fit the label encoder on all_labels
+        label_encoder = LabelEncoder()
+        label_encoder.fit(all_labels)
 
-        if any(not np.isfinite(v) for v in pos):
-            print(f"⚠️ Skipping {persistent_id}: Invalid position values (x={x}, y={y}, z={z})")
-            continue
+        # 3️⃣ Transform the actual device IDs from the training data
+        encoded_devices = label_encoder.transform(devices_in_data)
 
-        # 3) Compute additional wall feature(s)
-        # For each sensor, see if sensor->device crosses a wall, sum them all
-        total_penalty = 0.0
-        for i, smac in enumerate(sensor_macs):
-            s_pos = sensor_data[smac]["position"]
-            # pos is the device position (x,y,z)
-            total_penalty += total_wall_penalty(s_pos, pos, walls)
+        # 4️⃣ Combine sensor RSSI features with the encoded device ID
+        features = np.column_stack((features, encoded_devices))
 
-        # Build 'row_with_wall' by adding the total_penalty as a new dimension
-        row_with_wall = np.concatenate([row_rssi, [total_penalty]])
+        # 5️⃣ Train the RandomForestRegressor
+        model = RandomForestRegressor(n_estimators=100, random_state=42)
+        model.fit(features, labels)
 
-        # Now append row_with_wall (NOT row_rssi)
-        features.append(row_with_wall)
-        labels.append(pos)
-        weights.append(weight)
+        print(f"✅ ML model trained on {len(features)} samples across multiple devices.")
 
-    conn.close()
-
-    if not features:
-        print("❌ No valid features found! Training aborted.")
-        return
-
-    features = np.array(features)
-    labels = np.array(labels)
-    weights = np.array(weights)
-
-    print(f"✅ Training ML model with {len(features)} samples.")
-
-    try:
-        model = XGBRegressor(n_estimators=200, learning_rate=0.05, max_depth=6, random_state=42)
-
-        print("🔍 Checking labels for NaN or infinite values...")
-        if np.any(np.isnan(labels)) or np.any(np.isinf(labels)):
-            print(f"❌ ERROR: NaN or Inf detected in labels! Aborting training.")
-            return
-
-        model.fit(features, labels, sample_weight=weights)
-        print(f"✅ ML model trained on {len(features)} samples.")
-
-        # **Save the updated model along with sensor_macs**
+        # Save the model, sensor_macs, and label_encoder
         with open(MODEL_FILE, "wb") as f:
             pickle.dump((model, sensor_macs, label_encoder), f)
+        print(f"💾 ML Model saved to {MODEL_FILE}")
 
-    except Exception as e:
-        print(f"❌ Error during ML training: {e}")
+        return model, sensor_macs, label_encoder
 
 def generate_room_color(room_name):
     """Generate a stable color for a room based on its name."""
@@ -369,260 +160,210 @@ def generate_room_color(room_name):
 
 # Trilateration function
 def trilaterate(sensors, distances):
-    """Compute device position based on sensor positions and estimated distances."""
+    def residuals(pos, sensors, distances):
+        return [np.linalg.norm(pos - np.array(sensor)) - dist for sensor, dist in zip(sensors, distances)]
 
-    def residuals(pos, sensors, distances, weights):
-        """Calculate the error between estimated and actual distances."""
-        return weights * (np.linalg.norm(pos - np.array(sensors), axis=1) - distances)
+    # Debugging: Print input values before running least squares
+    print(f"📡 Trilateration Sensors: {sensors}")
+    print(f"📏 Trilateration Distances: {distances}")
 
-    print(f"📡 Trilateration Sensors (Positions): {sensors}")
-    print(f"📏 Trilateration Distances (Meters): {distances}")
-
-    if len(sensors) < 3:
-        print("⚠️ Not enough sensors for trilateration.")
-        return None
-
-    sensors = np.array(sensors)
-    distances = np.array(distances)
-
-    # Fix: Ensure distances are within a reasonable range
-    distances = np.clip(distances, -2, 13)  # Min 0.5m, Max 15m
-
-    # Fix: Ensure Z-axis influence is weighted properly
-    weights = 1 / (np.square(distances) + 0.1)  # Avoid division by zero
-
+    # Initial guess (center of all sensors)
     initial_guess = np.mean(sensors, axis=0)
 
     try:
-        result = least_squares(residuals, initial_guess, args=(sensors, distances, weights))
-        estimated_position = result.x
-
-        # Fix: Ensure estimated Z value is within bounds
-        estimated_position[2] = max(0, min(estimated_position[2], 6))  # Z should be between 0-3 meters
-
-        print(f"✅ Trilateration Result: {estimated_position}")
-        return estimated_position
+        result = least_squares(residuals, initial_guess, args=(sensors, distances))
+        print(f"✅ Trilateration Result: {result.x}")
+        return result.x
     except Exception as e:
         print(f"❌ Trilateration Error: {e}")
         return None
 
 def get_live_position():
-    global rssi_data, model, sensor_macs
+    global rssi_data, model, label_encoder, sensor_macs
 
     if not rssi_data:
         print("⚠️ No RSSI data available.")
         return None
 
-    persistent_id = global_state.get("persistent_id")
-    if not persistent_id or persistent_id not in rssi_data:
-        print(f"⚠️ Persistent ID {persistent_id} not recognized in RSSI data.")
+    persistent_id = next((pid for pid in rssi_data.keys() if len(rssi_data[pid]) >= 3), None)
+    if not persistent_id:
+        print("⚠️ No valid persistent_id with sufficient RSSI readings.")
         return None
 
-#    print(f"📡 Fetching RSSI data for {persistent_id}: {rssi_data[persistent_id]}")
+    print(f"🟢 Computing position for {persistent_id} using {len(rssi_data[persistent_id])} RSSI readings...")
+    for mac, rssi in rssi_data[persistent_id].items():
+        print(f"📡 {mac} → RSSI: {rssi}")
 
-    # **Always use the same sensor MACs from the trained model**
-    if model is None or not sensor_macs:
+    # Ensure our model is loaded/trained; if not, retrain it.
+    if model is None:
         print("⚠️ No trained ML model available. Retraining now...")
         train_ml_model()
 
-    if model is None or not sensor_macs:
-        print("❌ No valid model available. Skipping prediction.")
-        return None
+    # Build the feature vector from the live sensor data (for all sensors in sensor_macs)
+    if model is not None and sensor_macs is not None and label_encoder is not None:
+        print("✅ Using trained ML model.")
+        rssi_features = []
+        for mac in sensor_macs:  # sensor_macs is set as sorted(sensor_data.keys()) during training
+            rssi_val = rssi_data[persistent_id].get(mac, -100)
+            sensor_pos = sensor_data.get(mac, {}).get("position", (0, 0, 0))
+            rssi_features.extend([rssi_val, sensor_pos[0], sensor_pos[1], sensor_pos[2]])
 
-    # **Build RSSI vector with consistent sensor order**
-    rssi_values = np.array([rssi_data[persistent_id].get(mac, -100) for mac in sensor_macs])
+        try:
+            encoded_device = label_encoder.transform([persistent_id])[0]
+        except (ValueError, AttributeError):
+            print(f"⚠️ Persistent ID {persistent_id} not recognized. Falling back to 'generic'.")
+            encoded_device = label_encoder.transform(["generic"])[0]
 
-    total_penalty = 0.0
-    for smac in sensor_macs:
-        s_pos = sensor_data[smac]["position"]
-        # You might not have a known device position at this point, so you can:
-        # (a) do a dummy approach: e.g., no penalty => 0
-        # (b) or iterative approach if you want "on-the-fly" path-loss.
-        # For now, let's keep it simple:
-        pass
+        input_vector = np.append(rssi_features, encoded_device).reshape(1, -1)
 
-    # Next, compute or approximate the same penalty dimension
-    total_penalty = 0.0
-    # If you want a real on-the-fly penalty, you'd do:
-    # for smac in sensor_macs:
-    #     total_penalty += total_wall_penalty(sensor_data[smac]["position"], ???, walls)
-    # But for now we keep it at 0.0 or a placeholder
+        # Get the ML model prediction
+        with model_lock:
+            if not hasattr(model, 'estimators_') or len(model.estimators_) == 0:
+                print("⚠️ Model not ready, skipping prediction.")
+                ml_prediction = None
+            else:
+                ml_prediction = model.predict(input_vector)[0]
+        print(f"🔍 ML Predicted Position for {persistent_id} → {ml_prediction}")
 
-    rssi_with_penalty = np.concatenate([rssi_values, [total_penalty]])
-
-    # Finally call predict:
-
-    if len(rssi_values) != len(sensor_macs):
-        print(f"❌ Feature shape mismatch: Expected {len(sensor_macs)}, Got {len(rssi_values)}")
-        return None
-
-#    print(f"🧐 RSSI Vector for ML Model: {rssi_values}")
-
-    try:
-        predicted_position = model.predict(rssi_with_penalty.reshape(1, -1))[0]
-        print(f"🔍 ML Predicted Position for {persistent_id} → {predicted_position}")
-        return predicted_position
-    except Exception as e:
-        print(f"❌ Error during prediction: {e}")
-        return None
-
-def store_training_data(persistent_id, mac_address, estimated_position=None, rssi_snapshot=None):
-    """Store RSSI-based training data in SQLite for future ML training."""
-    global new_readings_count
-
-    if rssi_snapshot is None:
-        rssi_snapshot = rssi_data.get(persistent_id, {})
-
-    valid_rssi_readings = {k: v for k, v in rssi_snapshot.items() if v != -100}
-    if len(valid_rssi_readings) < 3:
-#        print(f"⚠️ Not enough valid RSSI readings for {persistent_id}. Skipping storage.")
-        return
-
-    # Extract last octet of beacon MAC and generate its expected sensor MAC
-    octets = mac_address.split(":")
-    last_octet = int(octets[-1], 16)
-    expected_sensor_mac = ":".join(octets[:-1] + [f"{(last_octet - 2) % 256:02x}"])
-
-    if global_state["training_mode"] and persistent_id == global_state["persistent_id"]:
-        estimated_position = global_state["actual_position"]
-        weight = 3  # training sample
-    elif expected_sensor_mac in sensor_data:
-        estimated_position = sensor_data[expected_sensor_mac]["position"]
-        weight = 2  # sensor-based reading
     else:
-        return
+        print("ML model or label_encoder not available. Falling back to trilateration.")
+        ml_prediction = None
 
-    new_readings_count += 1
-    if new_readings_count >= 100:
-        print("🔄 Retraining model after 1000 new readings.")
-        train_ml_model()
-        new_readings_count = 0
+    # Compute a live trilateration estimate using current sensor positions and distances
+    sensors = []
+    distances = []
+    for mac, rssi in rssi_data[persistent_id].items():
+        if mac in sensor_data:
+            distance = rssi_to_distance(rssi)
+            sensors.append(sensor_data[mac]["position"])
+            distances.append(distance)
+    if len(sensors) >= 3:
+        sensors = np.array(sensors)
+        distances = np.array(distances)
+        trilat_prediction = trilaterate(sensors, distances)
+        print(f"📍 Trilateration Prediction: {trilat_prediction}")
+    else:
+        print("❌ Not enough sensor readings for trilateration.")
+        trilat_prediction = None
 
+    # Blend the two estimates.
+    # Here we use a simple average if both are available.
+    if ml_prediction is not None and trilat_prediction is not None:
+        # Compute an average RSSI value across sensors (using sensor_macs)
+        avg_rssi = np.mean([rssi_data[persistent_id].get(mac, 100) for mac in sensor_macs])
+        # Lower RSSI (lower number) is more reliable. For example, if avg_rssi <= 3, use more weight for trilateration.
+        if avg_rssi <= 3:
+            w_trilat = 0.7
+        else:
+            w_trilat = 0.3
+        w_ml = 1 - w_trilat
+        final_prediction = w_ml * ml_prediction + w_trilat * trilat_prediction
+        print(f"🔀 Blended Prediction (avg RSSI: {avg_rssi:.2f}, weights ML: {w_ml:.2f}, trilat: {w_trilat:.2f}): {final_prediction}")
+        return final_prediction
+    elif ml_prediction is not None:
+        return ml_prediction
+    elif trilat_prediction is not None:
+        return trilat_prediction
+    else:
+        print("❌ Could not produce any estimate.")
+        return None
+
+def store_training_data(persistent_id, mac_address, estimated_position):
+    """Stores estimated positions for ML training dynamically."""
     conn = sqlite3.connect("training_data.db")
     cursor = conn.cursor()
 
-    rssi_json = json.dumps(valid_rssi_readings)
-    try:
-        x, y, z = map(float, estimated_position)
-    except Exception as e:
-        print(f"❌ Error converting position to float for {persistent_id}: {estimated_position}")
-        return
+    inserted_count = 0  # Count how many records are inserted
 
-    if not np.isfinite(x) or not np.isfinite(y) or not np.isfinite(z):
-        print(f"❌ Invalid position detected: x={x}, y={y}, z={z}. Skipping.")
-        conn.close()
-        return
+    for sensor_mac, rssi in rssi_data.get(persistent_id, {}).items():
+        if rssi is None or not isinstance(rssi, (int, float)):
+            print(f"⚠️ Skipping sensor {sensor_mac} due to invalid RSSI value: {rssi}")
+            continue
 
-    if global_state["training_mode"] or expected_sensor_mac in sensor_data:
-        try:
-            cursor.execute("""
-            INSERT INTO training_data (persistent_id, mac_address, rssi_json, x, y, z, weight, position_available)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (persistent_id, mac_address, rssi_json, x, y, z, 3, 1))
+        print(f"✅ Storing training data: Persistent ID={persistent_id}, Sensor={sensor_mac}, RSSI={rssi}, Position={estimated_position}")
 
-            conn.commit()
-            print(f"✅ Training data stored for {persistent_id} (x={x}, y={y}, z={z})")
+        cursor.execute("""
+        INSERT INTO training_data (persistent_id, mac_address, sensor_mac, rssi, x, y, z)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (persistent_id, mac_address, sensor_mac, float(rssi), estimated_position[0], estimated_position[1], estimated_position[2]))
 
-        except sqlite3.Error as e:
-            print(f"❌ SQLite Error: {e}")
-        finally:
-            conn.close()
-
-def store_sensor_positions():
-    """Store the known sensor positions in the database for reference."""
-    conn = sqlite3.connect("training_data.db")
-    cursor = conn.cursor()
-
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS sensor_positions (
-        mac_address TEXT PRIMARY KEY,
-        x FLOAT NOT NULL,
-        y FLOAT NOT NULL,
-        z FLOAT NOT NULL
-    );
-    """)
-
-    for mac, data in sensor_data.items():
-        x, y, z = data["position"]
-        try:
-            cursor.execute("""
-            INSERT OR REPLACE INTO sensor_positions (mac_address, x, y, z)
-            VALUES (?, ?, ?, ?)
-            """, (mac, x, y, z))
-        except sqlite3.Error as e:
-            print(f"❌ SQLite Error storing sensor positions: {e}")
+        inserted_count += 1  # Count successful insertions
 
     conn.commit()
     conn.close()
 
-def smooth_rssi(persistent_id, sensor_mac, new_rssi, alpha=0.2):
-    """Applies exponential smoothing to reduce RSSI fluctuations."""
-    if persistent_id not in rssi_data:
-        rssi_data[persistent_id] = {}
-
-    if sensor_mac in rssi_data[persistent_id]:
-        previous_rssi = rssi_data[persistent_id][sensor_mac]
-        smoothed_rssi = alpha * new_rssi + (1 - alpha) * previous_rssi  # Exponential smoothing formula
+    if inserted_count == 0:
+        print("⚠️ No training data was inserted! Check if RSSI data exists.")
     else:
-        smoothed_rssi = new_rssi  # No previous value, use new RSSI
+        print(f"✅ Successfully stored {inserted_count} new training samples!")
 
-    return smoothed_rssi
+    print("\n🔄 Retraining ML Model with Updated Data...")
+    threading.Thread(target=train_ml_model, daemon=True).start()
 
 def on_message(client, userdata, msg):
-    global new_readings_count
+    global rssi_data
     try:
-        payload_str = msg.payload.decode(errors='ignore')
-        payload = json.loads(payload_str)
+        payload = json.loads(msg.payload.decode())
+        topic_parts = msg.topic.split("/")
 
-        persistent_id = payload.get("persistent_id", payload.get("device", None))
-        if not persistent_id:
-            print(f"⚠️ Missing persistent_id! Skipping message.")
+        if len(topic_parts) < 5:
+            print(f"Skipping malformed topic: {msg.topic}")
             return
 
-        beacon_mac = payload.get("device", "").lower()
-        scanner_mac = payload.get("scanner", "").split(" ")[-1].strip("()").lower()
-        new_rssi = payload.get("rssi")
-
-        if new_rssi is None or not isinstance(new_rssi, (int, float)):
-            print(f"⚠️ Invalid RSSI value: {new_rssi}. Skipping.")
+        sensor_mac = topic_parts[3].lower()
+        rssi_value = payload.get("rssi")
+        if rssi_value is None or not isinstance(rssi_value, (int, float)):
+            print(f"⚠️ Received invalid RSSI value: {rssi_value}. Skipping update.")
             return
 
-#        print(f"📩 New RSSI: PersistentID={persistent_id}, Scanner={scanner_mac}, RSSI={new_rssi}")  # Debugging
+        persistent_id = payload.get("persistent_id")
+        mac_address = payload.get("device")
 
-        smoothed_rssi = smooth_rssi(persistent_id, scanner_mac, new_rssi)
-        rssi_data.setdefault(persistent_id, {})[scanner_mac] = smoothed_rssi
+        if persistent_id is None:
+            print(f"⚠️ Warning: persistent_id is missing! Using mac_address ({mac_address}) as fallback.")
+            persistent_id = mac_address
 
-#        print(f"📊 Updated RSSI Data: {rssi_data[persistent_id]}")  # Debugging
+        if sensor_mac in sensor_data:
+            sensor_name = sensor_data[sensor_mac]["name"]
 
-        # **Process Data**
-        estimated_position = get_live_position()
-        store_training_data(persistent_id, beacon_mac, estimated_position, rssi_snapshot=rssi_data.get(persistent_id))
+            if persistent_id not in rssi_data:
+                rssi_data[persistent_id] = {}
+
+            rssi_data[persistent_id][sensor_mac] = rssi_value  # Store the raw RSSI value
+            calculated_distance = rssi_to_distance(rssi_value)
+            print(f"Updated rssi_data: {persistent_id} ({sensor_name}) -> {calculated_distance:.2f} m")
+
+            # Ensure we have enough valid readings
+#            if len(rssi_data[persistent_id]) >= min(3, len(sensor_data)):  # Adjust dynamically based on available scanners
+            if len(rssi_data[persistent_id]) >= 3:
+                print("🟢 We have at least 3 RSSI readings, calling get_live_position() now...")
+                estimated_position = get_live_position()
+
+                if estimated_position is not None:
+                    print(f"🔴 New estimated position: {estimated_position}")
+
+                # If we are in training mode, have not yet stored data, and have an actual position, do so now:
+                if (global_state.get("training_mode")
+                    and not global_state.get("training_data_stored")
+                    and "actual_position" in global_state):
+                    print(f"📝 Training mode: Storing actual position {global_state['actual_position']} "
+                          f"for persistent_id={persistent_id}")
+
+                    print("🟢 Store new entry to database, calling store_training_data() now...")
+                    store_training_data(
+                        persistent_id,
+                        mac_address,
+                        global_state["actual_position"]
+                    )
+
+#                    global_state["training_data_stored"] = True
+                    print("✅ Done storing training data!")
+
+        else:
+            print(f"⚠️ Received RSSI but sensor {sensor_mac} not in known sensors list.")
 
     except Exception as e:
-        print(f"❌ MQTT Error: {e}")
-
-def downsample_database():
-    """Keeps the database size manageable by removing older data."""
-    conn = sqlite3.connect("training_data.db")
-    cursor = conn.cursor()
-
-    # Determine number of rows
-    cursor.execute("SELECT COUNT(*) FROM training_data")
-    total_rows = cursor.fetchone()[0]
-
-    # Keep only the latest 10,000 records
-    max_rows = 10000
-    if total_rows > max_rows:
-        delete_rows = total_rows - max_rows
-        print(f"🗑️ Downsampling: Removing {delete_rows} old records...")
-        cursor.execute("""
-            DELETE FROM training_data WHERE id IN (
-                SELECT id FROM training_data ORDER BY timestamp ASC LIMIT ?
-            )
-        """, (delete_rows,))
-        conn.commit()
-
-    conn.close()
+        print(f"Error processing MQTT message: {e}")
 
 # **MQTT Authentication & Connection**
 def connect_mqtt():
@@ -633,13 +374,11 @@ def connect_mqtt():
     return client
 
 # Start MQTT Listener
-def start_mqtt_listener(update_interval=2):
-    """Start MQTT listener and periodically fetch live position."""
+def start_mqtt_listener(persistent_id):
     client = connect_mqtt()
-    topic = f"bermuda/+/scanner/+/rssi"
+    topic = f"bermuda/{persistent_id}/scanner/+/rssi"
     client.subscribe(topic)
     print(f"Subscribed to {topic}")
-
     client.loop_start()
 
     while True:
@@ -665,20 +404,6 @@ room_data = [
     {"name": "Bedroom", "floor": 1, "corners": [(7, 0), (7, 3.3), (10.1, 3.3), (10.1, 0)]},
     {"name": "Wardrobe", "floor": 1, "corners": [(7, 5), (7, 6.34), (8.3, 6.34), (8.3, 5)]},
     {"name": "Bathroom", "floor": 1, "corners": [(8.3, 3.3), (8.3, 6.34), (10.1, 6.34), (10.1, 3.3)]},
-]
-
-# In your config or near sensor_data
-walls = [
-    {
-      "corners": [(2.0, 2.0, 0.0), (2.0, 5.0, 0.0)],  # 2D line extended in z, or a small 3D block
-      "thickness": 0.25,
-      "impedance_db": 6.0
-    },
-    {
-      "corners": [(5.0, 1.0, 0.0), (7.0, 2.0, 0.0)],
-      "thickness": 0.3,
-      "impedance_db": 9.0
-    }
 ]
 
 rssi_data = {}
@@ -721,12 +446,37 @@ def find_room(estimated_position):
 
     return "Unknown Room"
 
-def path_loss_with_walls(sensor_pos, device_pos, base_pathloss):
-    wall_losses = 0.0
-    for w in walls:
-        if line_intersects_wall_3d(sensor_pos, device_pos, w):  # <-- updated
-            wall_losses += w["impedance_db"]
-    return base_pathloss + wall_losses
+def plot_live_trilateration(mac_address):
+    plt.ion()  # Enable interactive mode
+    fig = plt.figure()
+    ax = fig.add_subplot(111, projection='3d')
+
+    while True:
+        if len(rssi_data) >= 3:
+            sensors, distances = zip(*[(sensor_data[mac]["position"], dist) for mac, dist in rssi_data.get(persistent_id, {}).items() if mac in sensor_data])
+            #sensors, distances = zip(*[(sensor_data[mac]["position"], dist) for mac, dist in rssi_data.items() if mac in sensor_data])
+            estimated_position = trilaterate(np.array(sensors), np.array(distances))
+
+            ax.clear()
+            ax.set_xlabel('X Axis')
+            ax.set_ylabel('Y Axis')
+            ax.set_zlabel('Z Axis')
+
+            # Plot sensors
+            for mac, info in sensor_data.items():
+                pos = info["position"]
+                ax.scatter(*pos, c='blue', marker='o', s=80, label=info["name"] if mac == list(sensor_data.keys())[0] else "")
+                ax.text(pos[0], pos[1], pos[2], info["name"], color='black', fontsize=8)
+
+            # Plot estimated position
+            ax.scatter(*estimated_position, c='red', marker='x', s=100, label="Estimated Position")
+            ax.text(estimated_position[0], estimated_position[1], estimated_position[2], f"{mac_address}", color='red', fontsize=10)
+
+            plt.legend()
+            plt.draw()
+            plt.pause(2)  # Refresh every 2 seconds
+
+        time.sleep(1)  # Wait before updating
 
 # Visualization function
 def plot_3d_position(sensors, estimated_position):
@@ -741,7 +491,7 @@ def plot_3d_position(sensors, estimated_position):
         ax.clear()  # Clear previous frame
 
         # **Get live estimated position from MQTT**
-#        print("🟢 Calling get_live_position() to fetch latest estimated position...")
+        print("🟢 Calling get_live_position() to fetch latest estimated position...")
         estimated_position = get_live_position()  # Function to retrieve latest calculated position
 
         if estimated_position is None:
@@ -780,18 +530,6 @@ def plot_3d_position(sensors, estimated_position):
                 ceiling_surface = Poly3DCollection([ceiling_corners], color='gray', alpha=0.0, label="Ceiling")
                 ax.add_collection3d(ceiling_surface)
 
-        for wall in walls:
-            (x1, y1, z1), (x2, y2, z2) = wall["corners"]
-            # For a thin vertical wall, you could “extrude” in Z or thickness:
-            # Build a small rectangle or polygon representing the wall’s footprint
-            # Then plot with a Poly3DCollection or line, e.g.:
-            wall_polygon_corners = [
-                (x1, y1, z1),
-                (x2, y2, z2),
-                (x2, y2, z2 + 2.5),  # approximate height
-                (x1, y1, z1 + 2.5),
-            ]
-
         # **Draw rooms as flat surfaces with custom shapes**
         for room in room_data:
             floor_z = floor_heights[room["floor"]]
@@ -817,29 +555,21 @@ def plot_3d_position(sensors, estimated_position):
             ax.scatter(*pos, c='blue', marker='o', s=80, label="Sensor" if mac == list(sensor_data.keys())[0] else "")
             ax.text(pos[0], pos[1], pos[2], name, color='black', fontsize=8)
 
-        # Now draw dotted lines from each sensor to the device, with an RSSI label
-        # (assuming we can fetch the persistent_id and find the rssi_data from get_live_position)
+        # **Plot dashed lines connecting sensors with active RSSI reading to the estimated position**
         persistent_id = global_state.get("persistent_id")
-        if estimated_position is not None and persistent_id in rssi_data:
-            for mac, data in sensor_data.items():
-                sensor_pos = data["position"]
-                if mac in rssi_data[persistent_id]:
-                    # e.g.  -50 dBm
-                    rssi_val = rssi_data[persistent_id][mac]
-                else:
-                    rssi_val = -100  # default or unknown
-
-                # Plot dotted line from sensor_pos -> estimated_position
-                ax.plot([sensor_pos[0], estimated_position[0]],
-                        [sensor_pos[1], estimated_position[1]],
-                        [sensor_pos[2], estimated_position[2]],
-                        linestyle='dotted', color='green')
-
-                # Place an RSSI text near the midpoint
-                midx = (sensor_pos[0] + estimated_position[0]) / 2.0
-                midy = (sensor_pos[1] + estimated_position[1]) / 2.0
-                midz = (sensor_pos[2] + estimated_position[2]) / 2.0
-                ax.text(midx, midy, midz, f'RSSI: {rssi_val:.1f} dBm', color='green', fontsize=8)
+        if persistent_id in rssi_data:
+            for mac, rssi in rssi_data[persistent_id].items():
+                if mac in sensor_data:
+                    sensor_pos = sensor_data[mac]["position"]
+                    # Create an array of two points: the sensor and the estimated position
+                    line_points = np.array([sensor_pos, estimated_position])
+                    ax.plot(line_points[:, 0], line_points[:, 1], line_points[:, 2],
+                            linestyle='dashed', color='gray')
+                    # Compute the midpoint of the line
+                    midpoint = (np.array(sensor_pos) + np.array(estimated_position)) / 2
+                    # Display the RSSI value at the midpoint
+                    ax.text(midpoint[0], midpoint[1], midpoint[2], f"RSSI: {rssi:.2f}",
+                            color='blue', fontsize=8)
 
         # **Plot estimated position**
         if estimated_position is not None:
@@ -868,7 +598,7 @@ def get_device_position(yaml_file, sensor_data, mac_address):
     mac_address = mac_address.lower()  # Normalize input MAC address
 
     if mac_address not in data:
-#        print(f"MAC address {mac_address} not found in dataset.")
+        print(f"MAC address {mac_address} not found in dataset.")
         return None
 
     device_data = data[mac_address].get('scanners', {})
@@ -877,14 +607,14 @@ def get_device_position(yaml_file, sensor_data, mac_address):
 
     for sensor_mac, sensor_info in device_data.items():
         source_address = sensor_info.get('source', '').lower()  # Normalize source MAC address
-        distance = sensor_info.get('rssi_distance')
-
-        if distance is not None and source_address in sensor_data:
-            readings.append((sensor_data[source_address]["position"], distance))
+        rssi = sensor_info.get('rssi')
+        if rssi is not None and source_address in sensor_data:
+            calculated_distance = rssi_to_distance(rssi)
+            readings.append((sensor_data[source_address]["position"], calculated_distance))
             sensor_names.append(sensor_data[source_address]["name"])
 
     if len(readings) < 3:
-#        print(f"Not enough valid sensor readings for MAC {mac_address} to perform trilateration.")
+        print(f"Not enough valid sensor readings for MAC {mac_address} to perform trilateration.")
         return None
 
     sensors, distances = zip(*readings)
@@ -909,7 +639,7 @@ if __name__ == "__main__":
         global_state["actual_position"] = tuple(args.train)
 
     # Start MQTT listener in a separate thread
-    mqtt_thread = threading.Thread(target=start_mqtt_listener,)
+    mqtt_thread = threading.Thread(target=start_mqtt_listener, args=(args.persistent_id,))
     mqtt_thread.daemon = True
     mqtt_thread.start()
 
