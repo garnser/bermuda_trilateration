@@ -25,6 +25,10 @@ MQTT_USERNAME = "ble"
 MQTT_PASSWORD = "ble"
 MQTT_TOPIC_TEMPLATE = "bermuda/{mac_address}/scanner/+/rssi"
 
+# Define RSSI thresholds for weighting
+strong_rssi_threshold = -60  # Strong signal threshold
+weak_rssi_threshold = -80    # Weak signal threshold
+
 global_state = {
     "training_mode": False,
     "persistent_id": None,
@@ -35,6 +39,7 @@ MODEL_FILE = "ml_model.pkl"
 model_lock = threading.Lock()
 
 model = None
+prev_estimate = None
 label_encoder = None
 
 # Load YAML file
@@ -108,13 +113,35 @@ def train_ml_model():
         labels = []
         for persistent_id, sensor_mac, rssi, x, y, z in data:
             row_features = []
+            sensor_weights = {}
             for mac in sensor_macs:
                 # Use the RSSI if available; otherwise default to -100
                 sensor_rssi = rssi if sensor_mac == mac else -100
                 # Retrieve the fixed sensor position from sensor_data
                 sensor_pos = sensor_data.get(mac, {}).get("position", (0,0,0))
-                # Append both the RSSI and sensor position as part of the feature
-                row_features.extend([sensor_rssi, sensor_pos[0], sensor_pos[1], sensor_pos[2]])
+
+                # Compute sensor weight dynamically
+                if sensor_rssi >= strong_rssi_threshold:
+                    sensor_weight = 1.5  # Strong signal → higher weight
+                elif sensor_rssi < weak_rssi_threshold:
+                    sensor_weight = 0.3  # Weak signal → reduced weight
+                else:
+                    sensor_weight = 1.0  # Normal weight for mid-range signals
+                sensor_weights[mac] = sensor_weight
+                row_features.extend([
+                    sensor_rssi * sensor_weight,  # Adjust RSSI by weight
+                    sensor_pos[0],
+                    sensor_pos[1],
+                    sensor_pos[2]])
+            # Now, add additional features: pairwise differences between the RSSI values.
+            for i in range(len(sensor_macs)):
+                for j in range(i+1, len(sensor_macs)):
+                    # Get the RSSI value for sensor i and sensor j:
+                    rssi_i = rssi if sensor_mac == sensor_macs[i] else -100
+                    rssi_j = rssi if sensor_mac == sensor_macs[j] else -100
+                    weight_i = sensor_weights.get(sensor_macs[i], 1.0)
+                    weight_j = sensor_weights.get(sensor_macs[j], 1.0)
+                    row_features.append(rssi_i - rssi_j)
             features.append(row_features)
             labels.append([x, y, z])
 
@@ -159,19 +186,21 @@ def generate_room_color(room_name):
     return (r, g, b, 1)  # Use alpha=0.5 for transparency
 
 # Trilateration function
-def trilaterate(sensors, distances):
-    def residuals(pos, sensors, distances):
-        return [np.linalg.norm(pos - np.array(sensor)) - dist for sensor, dist in zip(sensors, distances)]
+def trilaterate(sensors, distances, sensor_weights):
+    def residuals(pos, sensors, distances, sensor_weights):
+        return [(np.linalg.norm(pos - np.array(sensor)) - dist) * weight
+                for sensor, dist, weight in zip(sensors, distances, sensor_weights)]
 
     # Debugging: Print input values before running least squares
     print(f"📡 Trilateration Sensors: {sensors}")
     print(f"📏 Trilateration Distances: {distances}")
+    print(f"⚖ Sensor Weights: {sensor_weights}")
 
     # Initial guess (center of all sensors)
     initial_guess = np.mean(sensors, axis=0)
 
     try:
-        result = least_squares(residuals, initial_guess, args=(sensors, distances))
+        result = least_squares(residuals, initial_guess, args=(sensors, distances, sensor_weights))
         print(f"✅ Trilateration Result: {result.x}")
         return result.x
     except Exception as e:
@@ -194,6 +223,18 @@ def get_live_position():
     for mac, rssi in rssi_data[persistent_id].items():
         print(f"📡 {mac} → RSSI: {rssi}")
 
+    # Compute sensor weights dynamically based on RSSI strength
+    sensor_weights = {}
+
+    for mac in sensor_macs:
+        rssi = rssi_data[persistent_id].get(mac, -100)
+        if rssi >= strong_rssi_threshold:
+            sensor_weights[mac] = 1.5  # Strong signal → higher weight
+        elif rssi < weak_rssi_threshold:
+            sensor_weights[mac] = 0.3  # Weak signal → reduced weight
+        else:
+            sensor_weights[mac] = 1.0  # Normal weight for mid-range signals
+
     # Ensure our model is loaded/trained; if not, retrain it.
     if model is None:
         print("⚠️ No trained ML model available. Retraining now...")
@@ -203,10 +244,26 @@ def get_live_position():
     if model is not None and sensor_macs is not None and label_encoder is not None:
         print("✅ Using trained ML model.")
         rssi_features = []
-        for mac in sensor_macs:  # sensor_macs is set as sorted(sensor_data.keys()) during training
-            rssi_val = rssi_data[persistent_id].get(mac, -100)
+        for mac in sensor_macs:  # Use the same order as training
+            rssi = rssi_data[persistent_id].get(mac, -100)
+
             sensor_pos = sensor_data.get(mac, {}).get("position", (0, 0, 0))
-            rssi_features.extend([rssi_val, sensor_pos[0], sensor_pos[1], sensor_pos[2]])
+            weight = sensor_weights.get(mac, 1.0)
+            rssi_features.extend([
+                rssi * weight,  # Adjust RSSI contribution
+                sensor_pos[0],
+                sensor_pos[1],
+                sensor_pos[2]])
+
+        # Now add the pairwise differences between the RSSI values for each sensor.
+        for i in range(len(sensor_macs)):
+            for j in range(i+1, len(sensor_macs)):
+                # Use the stored RSSI values for the sensors; default to -100 if missing.
+                rssi_i = rssi_data[persistent_id].get(sensor_macs[i], -100)
+                rssi_j = rssi_data[persistent_id].get(sensor_macs[j], -100)
+                weight_i = sensor_weights.get(sensor_macs[i], 1.0)
+                weight_j = sensor_weights.get(sensor_macs[j], 1.0)
+                rssi_features.append((rssi_i - rssi_j) * min(weight_i, weight_j))
 
         try:
             encoded_device = label_encoder.transform([persistent_id])[0]
@@ -232,15 +289,18 @@ def get_live_position():
     # Compute a live trilateration estimate using current sensor positions and distances
     sensors = []
     distances = []
+    sensor_weight_list = []
     for mac, rssi in rssi_data[persistent_id].items():
         if mac in sensor_data:
             distance = rssi_to_distance(rssi)
+            weight = sensor_weights.get(mac, 1.0)
             sensors.append(sensor_data[mac]["position"])
-            distances.append(distance)
+            distances.append(distance * weight)  # Adjust distance based on weight
+            sensor_weight_list.append(weight)
     if len(sensors) >= 3:
         sensors = np.array(sensors)
         distances = np.array(distances)
-        trilat_prediction = trilaterate(sensors, distances)
+        trilat_prediction = trilaterate(sensors, distances, sensor_weight_list)
         print(f"📍 Trilateration Prediction: {trilat_prediction}")
     else:
         print("❌ Not enough sensor readings for trilateration.")
@@ -249,16 +309,29 @@ def get_live_position():
     # Blend the two estimates.
     # Here we use a simple average if both are available.
     if ml_prediction is not None and trilat_prediction is not None:
-        # Compute an average RSSI value across sensors (using sensor_macs)
-        avg_rssi = np.mean([rssi_data[persistent_id].get(mac, 100) for mac in sensor_macs])
-        # Lower RSSI (lower number) is more reliable. For example, if avg_rssi <= 3, use more weight for trilateration.
-        if avg_rssi <= 3:
-            w_trilat = 0.7
-        else:
-            w_trilat = 0.3
+        avg_rssi = np.mean([rssi_data[persistent_id].get(mac, -100) for mac in sensor_macs])
+        strong_signals = [rssi for rssi in rssi_data[persistent_id].values() if rssi >= strong_rssi_threshold]
+        weak_signals = [rssi for rssi in rssi_data[persistent_id].values() if rssi < weak_rssi_threshold]
+
+        strong_signal_ratio = len(strong_signals) / max(1, len(sensor_macs))
+        weak_signal_ratio = len(weak_signals) / max(1, len(sensor_macs))
+
+        w_trilat = 0.3 + (0.4 * strong_signal_ratio)  # More weight for strong signals
         w_ml = 1 - w_trilat
+
         final_prediction = w_ml * ml_prediction + w_trilat * trilat_prediction
         print(f"🔀 Blended Prediction (avg RSSI: {avg_rssi:.2f}, weights ML: {w_ml:.2f}, trilat: {w_trilat:.2f}): {final_prediction}")
+
+        # Clamp the change: limit movement to 1 meter per update.
+        global prev_estimate
+        if prev_estimate is not None:
+            diff = final_prediction - prev_estimate
+            norm_diff = np.linalg.norm(diff)
+            if norm_diff > 0.5:
+                print(f"⚠️ Movement limited: Actual diff {norm_diff:.2f}m, clamped to 0.5m.")
+                final_prediction = prev_estimate + (diff / norm_diff) * 0.5  # Scale down movement
+        prev_estimate = final_prediction
+
         return final_prediction
     elif ml_prediction is not None:
         return ml_prediction
