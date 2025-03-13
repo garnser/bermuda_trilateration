@@ -1,5 +1,6 @@
 # positioning.py
 import numpy as np
+from logger import logger, training_logger
 from scipy.optimize import least_squares
 from config import STRONG_RSSI_THRESHOLD, WEAK_RSSI_THRESHOLD, sensor_data, rssi_data, global_state
 from utils import rssi_to_distance
@@ -14,17 +15,17 @@ def trilaterate(sensors, distances, sensor_weights):
         result = least_squares(residuals, initial_guess, args=(sensors, distances, sensor_weights))
         return result.x
     except Exception as e:
-        print(f"Trilateration error: {e}")
+        logger.error(f"[ERROR] Trilateration error: {e}")
         return None
 
 def get_live_position():
     if not rssi_data:
-        print("No RSSI data available.")
+        logger.warning("[WARNING] No RSSI data available.")
         return None
 
     persistent_id = next((pid for pid, readings in rssi_data.items() if len(readings) >= 3), None)
     if not persistent_id:
-        print("No valid persistent_id with sufficient RSSI readings.")
+        logger.warning("[WARNING] No valid persistent_id with sufficient RSSI readings.")
         return None
 
     # Compute sensor weights based on RSSI strength.
@@ -38,9 +39,9 @@ def get_live_position():
         else:
             sensor_weights[mac] = 1.0
 
-    # Ensure the ML model is loaded/trained.
+    # Ensure the ML model is loaded/trained if training data exists.
     if ml_model.model is None:
-        print("No trained ML model. Training now...")
+        logger.info("[INFO] No trained ML model. Training now...")
         ml_model.train_ml_model(rssi_data)
 
     # Build the feature vector for the ML model.
@@ -70,11 +71,26 @@ def get_live_position():
         encoded_device = ml_model.label_encoder.transform(["generic"])[0]
 
     input_vector = np.append(rssi_features, encoded_device).reshape(1, -1)
+
+    # DEBUG: Log input vector details.
+    logger.debug("[DEBUG] Constructed input_vector: %s", input_vector)
+    logger.debug("[DEBUG] input_vector shape: %s", input_vector.shape)
+    if np.any(np.isnan(input_vector)):
+        logger.error("[ERROR] NaN values detected in input_vector!")
+
     with ml_model.model_lock:
-        if not hasattr(ml_model.model, 'estimators_') or len(ml_model.model.estimators_) == 0:
+        if ml_model.model is None or not hasattr(ml_model.model, 'estimators_') or len(ml_model.model.estimators_) == 0:
             ml_prediction = None
         else:
-            ml_prediction = ml_model.model.predict(input_vector)[0]
+            # DEBUG: Get predictions from each estimator.
+            individual_preds = [est.predict(input_vector)[0] for est in ml_model.model.estimators_]
+            logger.debug("[DEBUG] Individual estimator predictions: %s", individual_preds)
+            ml_prediction = np.mean(individual_preds, axis=0)
+
+    # Check for NaN in ML prediction
+    if ml_prediction is not None and np.any(np.isnan(ml_prediction)):
+        logger.warning("[WARNING] ML prediction contains NaN values. Ignoring ML prediction.")
+        ml_prediction = None
 
     # Compute a trilateration estimate.
     sensors_list = []
@@ -99,14 +115,33 @@ def get_live_position():
         w_trilat = 0.3  # Adjust weights as needed
         w_ml = 1 - w_trilat
         final_prediction = w_ml * ml_prediction + w_trilat * trilat_prediction
-        return final_prediction
     elif ml_prediction is not None:
-        return ml_prediction
+        final_prediction = ml_prediction
     elif trilat_prediction is not None:
-        return trilat_prediction
+        final_prediction = trilat_prediction
     else:
-        print("Could not produce any estimate.")
+        logger.warning("[ERROR] Could not produce any estimate.")
         return None
+
+    # Verify that the final prediction does not contain NaN values.
+    if np.any(np.isnan(final_prediction)):
+        logger.error("[ERROR] Final prediction contains NaN values. Returning fallback position.")
+        return None
+
+    # Apply filtering placeholder to the final prediction.
+    from utils import apply_filtering
+    final_prediction = apply_filtering(final_prediction)
+
+    # Training mode: compute score only if actual position is provided.
+    if global_state.get("training_mode") and global_state.get("actual_position"):
+        actual = np.array(global_state["actual_position"])
+        estimated = np.array(final_prediction)
+        error = np.linalg.norm(actual - estimated)
+        score = 1 - min(1, error / 5.0)
+        training_logger.info(f"[TRAINING] Actual: {actual}, Estimated: {estimated}, Error: {error:.2f}, Score: {score:.2f}")
+        global_state["training_score"] = score
+
+    return final_prediction
 
 def get_device_position(yaml_file, mac_address):
     from utils import load_yaml, rssi_to_distance

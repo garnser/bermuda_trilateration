@@ -6,6 +6,7 @@ import paho.mqtt.client as mqtt
 from config import MQTT_BROKER, MQTT_PORT, MQTT_USERNAME, MQTT_PASSWORD, global_state, sensor_data, MQTT_TOPIC_TEMPLATE, rssi_data, STRONG_RSSI_THRESHOLD
 from positioning import get_live_position
 from database import store_training_data
+from logger import logger
 
 def on_message(client, userdata, msg):
     try:
@@ -31,9 +32,9 @@ def on_message(client, userdata, msg):
                 # In training mode, store the data.
                 if global_state.get("training_mode") and global_state.get("actual_position"):
                     inserted = store_training_data(persistent_id, mac_address, global_state["actual_position"], rssi_data)
-                    print(f"Stored {inserted} training samples.")
+                    logger.info(f"[INFO] Stored {inserted} training samples.")
     except Exception as e:
-        print(f"MQTT message error: {e}")
+        logger.error(f"[ERROR] MQTT message error: {e}")
 
 def connect_mqtt():
     client = mqtt.Client()
@@ -46,7 +47,7 @@ def start_mqtt_listener(persistent_id):
     client = connect_mqtt()
     topic = MQTT_TOPIC_TEMPLATE.format(mac_address=persistent_id)
     client.subscribe(topic)
-    print(f"Subscribed to {topic}")
+    logger.info(f"[INFO] Subscribed to {topic}")
     client.loop_start()
     while True:
         time.sleep(1)

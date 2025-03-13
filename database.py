@@ -1,5 +1,7 @@
 # database.py
 import sqlite3
+import json
+from config import global_state
 
 DB_FILE = "training_data.db"
 
@@ -11,11 +13,11 @@ def init_database():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             persistent_id TEXT NOT NULL,
             mac_address TEXT,
-            sensor_mac TEXT,
-            rssi FLOAT,
+            rssi_json TEXT,
             x FLOAT,
             y FLOAT,
             z FLOAT,
+            score FLOAT,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -23,18 +25,16 @@ def init_database():
     conn.close()
 
 def store_training_data(persistent_id, mac_address, estimated_position, rssi_data):
+    score = global_state.get("training_score", None)
+    aggregated_rssi = rssi_data.get(persistent_id, {})
+    rssi_json = json.dumps(aggregated_rssi)
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    inserted_count = 0
-    for sensor_mac, rssi in rssi_data.get(persistent_id, {}).items():
-        if rssi is None or not isinstance(rssi, (int, float)):
-            continue
-        cursor.execute("""
-            INSERT INTO training_data (persistent_id, mac_address, sensor_mac, rssi, x, y, z)
+    cursor.execute("""
+            INSERT INTO training_data (persistent_id, mac_address, rssi_json, x, y, z, score)
             VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (persistent_id, mac_address, sensor_mac, float(rssi),
-              estimated_position[0], estimated_position[1], estimated_position[2]))
-        inserted_count += 1
+        """, (persistent_id, mac_address, rssi_json,
+              estimated_position[0], estimated_position[1], estimated_position[2], score))
     conn.commit()
     conn.close()
-    return inserted_count
+    return 1

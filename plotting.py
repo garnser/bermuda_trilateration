@@ -17,8 +17,8 @@ def plot_live_trilateration(mac_address):
     ax = fig.add_subplot(111, projection='3d')
     while True:
         # (Optional) implement live trilateration plotting here.
-        plt.pause(2)
-        time.sleep(1)
+        plt.pause(1)
+        time.sleep(0.5)
 
 def plot_3d_position():
     plt.ion()
@@ -97,6 +97,33 @@ def plot_3d_position():
             room_name = find_room(estimated_position, room_data)
             ax.text(estimated_position[0] + 0.3, estimated_position[1], estimated_position[2],
                     room_name, fontsize=10, fontweight='bold', color='red')
+
+            # Add info box with estimated position (2 decimals), room name, and sensor RSSI values.
+            pos_str = f"({estimated_position[0]:.2f}, {estimated_position[1]:.2f}, {estimated_position[2]:.2f})"
+            actual_str = ""
+            if global_state.get("training_mode") and global_state.get("actual_position"):
+                actual_pos = global_state["actual_position"]
+                actual_str = f"Actual Position: ({actual_pos[0]:.2f}, {actual_pos[1]:.2f}, {actual_pos[2]:.2f})\n"
+
+            persistent_id = global_state.get("persistent_id")
+            rssi_info = ""
+            if persistent_id in rssi_data:
+                for mac, rssi in rssi_data[persistent_id].items():
+                    sensor_name = sensor_data.get(mac, {}).get("name", mac)
+                    rssi_info += f"{sensor_name} ({mac}): {rssi:.2f} dB\n"
+
+            info_text = f"Estimated Position: {pos_str}\n"
+            info_text += actual_str
+            info_text += f"Room: {room_name}\n"
+            if global_state.get("training_mode") and global_state.get("training_score") is not None:
+                info_text += f"Training Score: {global_state['training_score']:.2f}\n"
+            info_text += rssi_info
+
+            if not hasattr(plot_3d_position, "info_box"):
+                plot_3d_position.info_box = fig.text(0.02, 0.5, info_text, fontsize=10,
+                                                      verticalalignment='center', bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5))
+            else:
+                plot_3d_position.info_box.set_text(info_text)
 
         ax.legend(handles=custom_handles, loc='upper left', bbox_to_anchor=(1.05, 1))
         ax.set_xlabel('X Axis')

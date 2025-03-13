@@ -1,3 +1,4 @@
+# config.py
 import numpy as np
 
 # MQTT configuration
@@ -9,9 +10,9 @@ MQTT_TOPIC_TEMPLATE = "bermuda/{mac_address}/scanner/+/rssi"
 
 # Model file and RSSI thresholds
 MODEL_FILE = "ml_model.pkl"
-STRONG_RSSI_THRESHOLD = -60
-WEAK_RSSI_THRESHOLD = -80
-TX_POWER = -60
+STRONG_RSSI_THRESHOLD = -70
+WEAK_RSSI_THRESHOLD = -90
+TX_POWER = -80
 
 # Global state
 global_state = {
@@ -19,6 +20,9 @@ global_state = {
     "persistent_id": None,
     "actual_position": None,
 }
+
+# Logging configuration
+LOGLEVEL = "DEBUG"  # Options: DEBUG, INFO, WARNING, ERROR
 
 # Sensor data
 sensor_data = {

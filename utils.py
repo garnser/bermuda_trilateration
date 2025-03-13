@@ -1,3 +1,4 @@
+# utils.py
 import yaml
 import hashlib
 from shapely.geometry import Polygon, Point
@@ -42,3 +43,10 @@ def find_room(estimated_position, room_data):
             if room_polygon.contains(estimated_point):
                 return room["name"]
     return "Unknown Room"
+
+def apply_filtering(position):
+    """
+    Placeholder for filtering logic (e.g., Kalman filter) to smooth position estimates.
+    Currently returns the input position unchanged.
+    """
+    return position
