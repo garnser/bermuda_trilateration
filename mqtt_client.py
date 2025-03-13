@@ -28,7 +28,26 @@ def on_message(client, userdata, msg):
             rssi_data[persistent_id][sensor_mac] = rssi_value
             # If enough readings exist, update the live position.
             if len(rssi_data[persistent_id]) >= 3:
-                _ = get_live_position()
+                # Always update the live position
+                estimated_pos = get_live_position()
+
+                # If training mode is active, store multiple snapshots
+                if global_state.get("training_mode") and global_state.get("actual_position"):
+                    now = time.time()
+                    # Check the last store time for this persistent_id
+                    if persistent_id not in global_state["last_store_time"]:
+                        global_state["last_store_time"][persistent_id] = 0
+
+                    # Example: store a new sample only if at least 2 seconds have passed
+                    if now - global_state["last_store_time"][persistent_id] > 2:
+                        inserted = store_training_data(
+                            persistent_id,
+                            mac_address,
+                            global_state["actual_position"],
+                            rssi_data
+                        )
+                        global_state["last_store_time"][persistent_id] = now
+                        logger.info(f"[INFO] Stored {inserted} training samples (1:many).")
                 # In training mode, store the data.
                 if global_state.get("training_mode") and global_state.get("actual_position"):
                     inserted = store_training_data(persistent_id, mac_address, global_state["actual_position"], rssi_data)

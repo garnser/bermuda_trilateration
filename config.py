@@ -19,6 +19,7 @@ global_state = {
     "training_mode": False,
     "persistent_id": None,
     "actual_position": None,
+    "last_store_time": {},  # track timestamps for 1:many training
 }
 
 # Logging configuration
