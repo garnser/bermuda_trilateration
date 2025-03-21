@@ -86,9 +86,12 @@ def plot_3d_position():
                     ax.plot(line[:, 0], line[:, 1], line[:, 2],
                             linestyle='dashed', color='gray')
                     midpoint = (sensor_pos + estimated_position) / 2
+                    if isinstance(rssi, list) and len(rssi) > 0:
+                        rssi_val = np.median(rssi)
+                    else:
+                        rssi_val = -100
                     ax.text(midpoint[0], midpoint[1], midpoint[2],
-                            f"RSSI: {rssi:.2f} dB", color='blue', fontsize=8)
-
+                            f"RSSI: {rssi_val:.2f} dB", color='blue', fontsize=8)
 
         # Plot the estimated position.
         if estimated_position is not None:
@@ -110,7 +113,11 @@ def plot_3d_position():
             if persistent_id in rssi_data:
                 for mac, rssi in rssi_data[persistent_id].items():
                     sensor_name = sensor_data.get(mac, {}).get("name", mac)
-                    rssi_info += f"{sensor_name} ({mac}): {rssi:.2f} dB\n"
+                    if isinstance(rssi, list) and len(rssi) > 0:
+                        rssi_val = np.median(rssi)
+                    else:
+                        rssi_val = -100
+                    rssi_info += f"{sensor_name} ({mac}): {rssi_val:.2f} dB\n"
 
             info_text = f"Estimated Position: {pos_str}\n"
             info_text += actual_str

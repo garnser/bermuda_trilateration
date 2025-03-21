@@ -27,7 +27,14 @@ def on_message(client, userdata, msg):
         if sensor_mac in sensor_data:
             if persistent_id not in rssi_data:
                 rssi_data[persistent_id] = {}
-            rssi_data[persistent_id][sensor_mac] = rssi_value
+            # Instead of storing just one value, keep a rolling list (up to 5).
+            if sensor_mac not in rssi_data[persistent_id]:
+                rssi_data[persistent_id][sensor_mac] = []
+            rssi_data[persistent_id][sensor_mac].append(rssi_value)
+
+            # Limit to the last 5 samples (discard older data).
+            if len(rssi_data[persistent_id][sensor_mac]) > 5:
+                rssi_data[persistent_id][sensor_mac].pop(0)
             # If enough readings exist, update the live position.
             if len(rssi_data[persistent_id]) >= 3:
                 # Always update the live position

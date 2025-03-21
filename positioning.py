@@ -31,10 +31,16 @@ def get_live_position():
     # Compute sensor weights based on RSSI strength.
     sensor_weights = {}
     for mac in sensor_data:
-        rssi = rssi_data[persistent_id].get(mac, -100)
-        if rssi >= STRONG_RSSI_THRESHOLD:
+        # Now rssi_data[persistent_id][mac] is a list of recent RSSI samples.
+        rssi_list = rssi_data[persistent_id].get(mac, [])
+        if not rssi_list:
+            rssi_val = -100
+        else:
+            rssi_val = np.median(rssi_list)
+
+        if rssi_val >= STRONG_RSSI_THRESHOLD:
             sensor_weights[mac] = 1.5
-        elif rssi < WEAK_RSSI_THRESHOLD:
+        elif rssi_val < WEAK_RSSI_THRESHOLD:
             sensor_weights[mac] = 0.3
         else:
             sensor_weights[mac] = 1.0
@@ -48,14 +54,28 @@ def get_live_position():
     sensor_macs = sorted(sensor_data.keys())
     rssi_features = []
     for mac in sensor_macs:
-        rssi = rssi_data[persistent_id].get(mac, -100)
+        # Use the median RSSI from the rolling list
+        rssi_list = rssi_data[persistent_id].get(mac, [])
+        if not rssi_list:
+            rssi_val = -100
+        else:
+            rssi_val = np.median(rssi_list)
         sensor_pos = sensor_data.get(mac, {}).get("position", (0, 0, 0))
         weight = sensor_weights.get(mac, 1.0)
-        rssi_features.extend([rssi * weight, sensor_pos[0], sensor_pos[1], sensor_pos[2]])
+        rssi_features.extend([rssi_val * weight, sensor_pos[0], sensor_pos[1], sensor_pos[2]])
     for i in range(len(sensor_macs)):
         for j in range(i + 1, len(sensor_macs)):
-            rssi_i = rssi_data[persistent_id].get(sensor_macs[i], -100)
-            rssi_j = rssi_data[persistent_id].get(sensor_macs[j], -100)
+            # Also for pairwise differences, use the median
+            list_i = rssi_data[persistent_id].get(sensor_macs[i], [])
+            list_j = rssi_data[persistent_id].get(sensor_macs[j], [])
+            if list_i:
+                rssi_i = np.median(list_i)
+            else:
+                rssi_i = -100
+            if list_j:
+                rssi_j = np.median(list_j)
+            else:
+                rssi_j = -100
             weight_i = sensor_weights.get(sensor_macs[i], 1.0)
             weight_j = sensor_weights.get(sensor_macs[j], 1.0)
             rssi_features.append((rssi_i - rssi_j) * min(weight_i, weight_j))
@@ -100,7 +120,13 @@ def get_live_position():
         if mac in sensor_data:
             # Look up the newly learned sensor-specific tx_power; fallback to config.TX_POWER
             sensor_tx_power = sensor_data[mac].get("tx_power", TX_POWER)
-            distance = rssi_to_distance(rssi, tx_power=sensor_tx_power)
+            # Use median again for the final distance calculation
+            rssi_list = rssi_data[persistent_id].get(mac, [])
+            if not rssi_list:
+                rssi_val = -100
+            else:
+                rssi_val = np.median(rssi_list)
+            distance = rssi_to_distance(rssi_val, tx_power=sensor_tx_power)
             weight = sensor_weights.get(mac, 1.0)
             sensors_list.append(sensor_data[mac]["position"])
             distances_list.append(distance * weight)
