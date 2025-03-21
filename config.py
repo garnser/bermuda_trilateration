@@ -20,11 +20,23 @@ global_state = {
     "persistent_id": None,
     "actual_position": None,
     "last_store_time": {},  # track timestamps for 1:many training
+    "samples_since_train": 0,  # track how many training samples since last re-train
 }
 
 # Logging configuration
 LOGLEVEL = "DEBUG"
 #LOGLEVEL = "WARNING"  # Options: DEBUG, INFO, WARNING, ERROR
+
+TRAIN_EVERY_N_SAMPLES = 5  # Retrain ML model every 5 newly stored training samples
+
+###############################################################################
+# DYNAMIC FUSION SETTINGS
+# For blending trilateration and ML based on trilateration RMS
+###############################################################################
+FUSION_TRILAT_MIN_RMS = 1.0       # If RMS <= 1.0m, trust trilateration strongly
+FUSION_TRILAT_MAX_RMS = 5.0       # If RMS >= 5.0m, ignore trilateration
+FUSION_TRILAT_MIN_WEIGHT = 0.0    # Minimum weight for trilateration
+FUSION_TRILAT_MAX_WEIGHT = 0.7    # Maximum weight for trilateration
 
 # Sensor data
 sensor_data = {

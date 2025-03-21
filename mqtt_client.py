@@ -3,7 +3,7 @@ import json
 import time
 import threading
 import paho.mqtt.client as mqtt
-from config import MQTT_BROKER, MQTT_PORT, MQTT_USERNAME, MQTT_PASSWORD, global_state, sensor_data, MQTT_TOPIC_TEMPLATE, rssi_data, STRONG_RSSI_THRESHOLD
+from config import MQTT_BROKER, MQTT_PORT, MQTT_USERNAME, MQTT_PASSWORD, global_state, sensor_data, MQTT_TOPIC_TEMPLATE, rssi_data, STRONG_RSSI_THRESHOLD, TRAIN_EVERY_N_SAMPLES
 from utils import estimate_tx_power
 from positioning import get_live_position
 from database import store_training_data, update_sensor_tx_power
@@ -67,10 +67,21 @@ def on_message(client, userdata, msg):
                                 update_sensor_tx_power(sensor_mac, tx_power_sample)
                                 logger.debug(f"[DEBUG] Updated tx_power for {sensor_mac} with sample {tx_power_sample:.2f}")
 
+                        # After storing a sample, possibly re-train the model.
+                        global_state.setdefault("samples_since_train", 0)
+                        global_state["samples_since_train"] += inserted
+                        if global_state["samples_since_train"] >= TRAIN_EVERY_N_SAMPLES:
+                            _retrain_ml_model()
+
                 # In training mode, store the data.
                 if global_state.get("training_mode") and global_state.get("actual_position"):
                     inserted = store_training_data(persistent_id, mac_address, global_state["actual_position"], rssi_data)
                     logger.info(f"[INFO] Stored {inserted} training samples.")
+
+                    global_state.setdefault("samples_since_train", 0)
+                    global_state["samples_since_train"] += inserted
+                    if global_state["samples_since_train"] >= TRAIN_EVERY_N_SAMPLES:
+                        _retrain_ml_model()
     except Exception as e:
         logger.error(f"[ERROR] MQTT message error: {e}")
 
@@ -89,3 +100,12 @@ def start_mqtt_listener(persistent_id):
     client.loop_start()
     while True:
         time.sleep(1)
+
+def _retrain_ml_model():
+    """
+    Helper to re-train the ML model and reset the sample counter.
+    """
+    from ml_model import train_ml_model
+    logger.info("[INFO] Re-training ML model with new samples...")
+    train_ml_model(rssi_data)
+    global_state["samples_since_train"] = 0

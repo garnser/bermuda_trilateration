@@ -2,8 +2,9 @@
 import numpy as np
 from logger import logger, training_logger
 from scipy.optimize import least_squares
-from config import STRONG_RSSI_THRESHOLD, WEAK_RSSI_THRESHOLD, sensor_data, rssi_data, global_state, TX_POWER
-from utils import rssi_to_distance, estimate_tx_power
+import math
+from config import STRONG_RSSI_THRESHOLD, WEAK_RSSI_THRESHOLD, sensor_data, rssi_data, global_state, TX_POWER, FUSION_TRILAT_MIN_RMS, FUSION_TRILAT_MAX_RMS, FUSION_TRILAT_MIN_WEIGHT, FUSION_TRILAT_MAX_WEIGHT
+from utils import rssi_to_distance, estimate_tx_power, apply_filtering
 import ml_model  # Import the entire module to access its current attributes
 
 def trilaterate(sensors, distances, sensor_weights):
@@ -17,6 +18,51 @@ def trilaterate(sensors, distances, sensor_weights):
     except Exception as e:
         logger.error(f"[ERROR] Trilateration error: {e}")
         return None
+
+def compute_trilat_rms(position, sensors, distances, weights):
+    """
+    Compute a simple RMS error between the distances implied by `position`
+    and the measured distances[] for each sensor.
+
+    position : np.array([x, y, z]) - final trilateration solution
+    sensors : list of sensor 3D coords
+    distances : list of measured distances (already scaled by sensor_weights if desired)
+    weights : list of the sensor_weights used in trilateration
+    returns: a float (RMS error)
+    """
+    if position is None or len(sensors) == 0:
+        return float('inf')
+    residuals = []
+    for (sensor_coord, dist, w) in zip(sensors, distances, weights):
+        # predicted distance from 'position' to sensor_coord
+        pred_dist = np.linalg.norm(position - np.array(sensor_coord))
+        # difference
+        diff = (pred_dist - dist)
+        residuals.append(diff * w)  # optionally multiply by w, or not
+    if len(residuals) == 0:
+        return float('inf')
+    # RMS
+    squared = [r**2 for r in residuals]
+    mean_sq = sum(squared) / len(squared)
+    return math.sqrt(mean_sq)
+
+def dynamic_trilat_weight(rms_error, min_rms=1.0, max_rms=5.0,
+                          min_weight=0.0, max_weight=0.7):
+    """
+    Returns a trilateration weight between min_weight and max_weight,
+    depending on how small or large the RMS error is.
+    If rms_error <= min_rms: weight = max_weight
+    If rms_error >= max_rms: weight = min_weight
+    Otherwise linearly interpolate between them.
+    """
+    if rms_error <= min_rms:
+        return max_weight
+    elif rms_error >= max_rms:
+        return min_weight
+    else:
+        # scale from [min_rms..max_rms] => [max_weight..min_weight]
+        frac = (rms_error - min_rms) / (max_rms - min_rms)  # 0..1
+        return (1 - frac)*max_weight + frac*min_weight
 
 def get_live_position():
     if not rssi_data:
@@ -140,9 +186,17 @@ def get_live_position():
 
     # Blend ML and trilateration estimates.
     if ml_prediction is not None and trilat_prediction is not None:
-        w_trilat = 0.3  # Adjust weights as needed
-        w_ml = 1 - w_trilat
+        trilat_rms = compute_trilat_rms(trilat_prediction, sensors_list, distances_list, sensor_weight_list)
+        w_trilat = dynamic_trilat_weight(
+            trilat_rms,
+            min_rms=FUSION_TRILAT_MIN_RMS,
+            max_rms=FUSION_TRILAT_MAX_RMS,
+            min_weight=FUSION_TRILAT_MIN_WEIGHT,
+            max_weight=FUSION_TRILAT_MAX_WEIGHT)
+        w_ml = 1.0 - w_trilat
         final_prediction = w_ml * ml_prediction + w_trilat * trilat_prediction
+        logger.debug(f"[DEBUG] Trilateration RMS: {trilat_rms:.2f}, w_trilat={w_trilat:.2f}, w_ml={w_ml:.2f}")
+        global_state["trilat_rms"] = trilat_rms  # Store RMS in global_state
     elif ml_prediction is not None:
         final_prediction = ml_prediction
     elif trilat_prediction is not None:
@@ -157,8 +211,10 @@ def get_live_position():
         return None
 
     # Apply filtering placeholder to the final prediction.
-    from utils import apply_filtering
     final_prediction = apply_filtering(final_prediction)
+
+    if "trilat_rms" not in global_state:
+        global_state["trilat_rms"] = None
 
     # Training mode: compute score only if actual position is provided.
     if global_state.get("training_mode") and global_state.get("actual_position"):

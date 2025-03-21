@@ -5,7 +5,7 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import matplotlib.patches as mpatches
 import numpy as np
 import time
-from config import sensor_data, room_data, floor_boundaries, global_state, rssi_data, CEILING_HEIGHT
+from config import sensor_data, room_data, floor_boundaries, global_state, rssi_data, CEILING_HEIGHT, global_state
 from utils import remove_overlapping_ceiling, find_room, generate_room_color
 
 # Pre-generate room colors.
@@ -96,7 +96,14 @@ def plot_3d_position():
         # Plot the estimated position.
         if estimated_position is not None:
             ax.scatter(*estimated_position, c='red', marker='x', s=100, label='Estimated Position')
-            from utils import find_room
+
+            if global_state.get("training_mode") and global_state.get("actual_position"):
+                actual_pos = global_state["actual_position"]
+                ax.scatter(
+                    actual_pos[0], actual_pos[1], actual_pos[2],
+                    c='green', marker='o', s=60, label='Training Ground Truth'
+                )
+
             room_name = find_room(estimated_position, room_data)
             ax.text(estimated_position[0] + 0.3, estimated_position[1], estimated_position[2],
                     room_name, fontsize=10, fontweight='bold', color='red')
@@ -125,6 +132,10 @@ def plot_3d_position():
             if global_state.get("training_mode") and global_state.get("training_score") is not None:
                 info_text += f"Training Score: {global_state['training_score']:.2f}\n"
             info_text += rssi_info
+
+            if "trilat_rms" in global_state and global_state["trilat_rms"] is not None:
+                rms_val = global_state["trilat_rms"]
+                info_text += f"Trilat RMS: {rms_val:.2f} m\n"
 
             if not hasattr(plot_3d_position, "info_box"):
                 plot_3d_position.info_box = fig.text(0.02, 0.5, info_text, fontsize=10,
