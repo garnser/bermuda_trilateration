@@ -4,9 +4,11 @@ import time
 import threading
 import paho.mqtt.client as mqtt
 from config import MQTT_BROKER, MQTT_PORT, MQTT_USERNAME, MQTT_PASSWORD, global_state, sensor_data, MQTT_TOPIC_TEMPLATE, rssi_data, STRONG_RSSI_THRESHOLD
+from utils import estimate_tx_power
 from positioning import get_live_position
-from database import store_training_data
+from database import store_training_data, update_sensor_tx_power
 from logger import logger
+import numpy as np
 
 def on_message(client, userdata, msg):
     try:
@@ -48,6 +50,16 @@ def on_message(client, userdata, msg):
                         )
                         global_state["last_store_time"][persistent_id] = now
                         logger.info(f"[INFO] Stored {inserted} training samples (1:many).")
+
+                        actual_pos = np.array(global_state["actual_position"])
+                        if sensor_mac in sensor_data:
+                            sensor_pos = np.array(sensor_data[sensor_mac]["position"])
+                            distance = np.linalg.norm(sensor_pos - actual_pos)
+                            tx_power_sample = estimate_tx_power(rssi_value, distance, n=2.0)
+                            if tx_power_sample is not None:
+                                update_sensor_tx_power(sensor_mac, tx_power_sample)
+                                logger.debug(f"[DEBUG] Updated tx_power for {sensor_mac} with sample {tx_power_sample:.2f}")
+
                 # In training mode, store the data.
                 if global_state.get("training_mode") and global_state.get("actual_position"):
                     inserted = store_training_data(persistent_id, mac_address, global_state["actual_position"], rssi_data)

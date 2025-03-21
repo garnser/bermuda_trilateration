@@ -10,7 +10,7 @@ MQTT_TOPIC_TEMPLATE = "bermuda/{mac_address}/scanner/+/rssi"
 
 # Model file and RSSI thresholds
 MODEL_FILE = "ml_model.pkl"
-STRONG_RSSI_THRESHOLD = -70
+STRONG_RSSI_THRESHOLD = -75
 WEAK_RSSI_THRESHOLD = -90
 TX_POWER = -80
 
@@ -23,7 +23,8 @@ global_state = {
 }
 
 # Logging configuration
-LOGLEVEL = "DEBUG"  # Options: DEBUG, INFO, WARNING, ERROR
+LOGLEVEL = "DEBUG"
+#LOGLEVEL = "WARNING"  # Options: DEBUG, INFO, WARNING, ERROR
 
 # Sensor data
 sensor_data = {

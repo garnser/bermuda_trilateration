@@ -2,6 +2,7 @@
 import yaml
 import hashlib
 from shapely.geometry import Polygon, Point
+import math
 from config import STRONG_RSSI_THRESHOLD, WEAK_RSSI_THRESHOLD, TX_POWER
 
 def load_yaml(file_path):
@@ -32,6 +33,15 @@ def remove_overlapping_ceiling(floor_boundaries):
         else:
             ceilings[floor] = poly_lower
     return ceilings
+
+def estimate_tx_power(rssi, distance, n=2.0):
+    """
+    Rearranges distance = 10^((tx_power - rssi)/(10*n)) to solve for tx_power:
+    tx_power = rssi + 10*n*log10(distance).
+    """
+    if distance <= 0:
+        return None
+    return rssi + 10.0 * n * math.log10(distance)
 
 def find_room(estimated_position, room_data):
     """Determine which room the estimated position is in."""

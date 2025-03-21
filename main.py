@@ -1,11 +1,11 @@
 # main.py
 import argparse
 import threading
-from database import init_database
+from database import init_database, init_calibration_database, load_tx_powers_into_sensor_data
 from ml_model import load_ml_model
 from mqtt_client import start_mqtt_listener
 from plotting import plot_3d_position
-from config import global_state
+from config import global_state, sensor_data
 
 def main():
     parser = argparse.ArgumentParser(description="Trilateration with ML training")
@@ -14,6 +14,8 @@ def main():
     args = parser.parse_args()
 
     init_database()
+    init_calibration_database()
+    load_tx_powers_into_sensor_data(sensor_data)
     load_ml_model()
     global_state["training_mode"] = args.train is not None
     global_state["persistent_id"] = args.persistent_id

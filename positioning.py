@@ -2,8 +2,8 @@
 import numpy as np
 from logger import logger, training_logger
 from scipy.optimize import least_squares
-from config import STRONG_RSSI_THRESHOLD, WEAK_RSSI_THRESHOLD, sensor_data, rssi_data, global_state
-from utils import rssi_to_distance
+from config import STRONG_RSSI_THRESHOLD, WEAK_RSSI_THRESHOLD, sensor_data, rssi_data, global_state, TX_POWER
+from utils import rssi_to_distance, estimate_tx_power
 import ml_model  # Import the entire module to access its current attributes
 
 def trilaterate(sensors, distances, sensor_weights):
@@ -98,7 +98,9 @@ def get_live_position():
     sensor_weight_list = []
     for mac, rssi in rssi_data[persistent_id].items():
         if mac in sensor_data:
-            distance = rssi_to_distance(rssi)
+            # Look up the newly learned sensor-specific tx_power; fallback to config.TX_POWER
+            sensor_tx_power = sensor_data[mac].get("tx_power", TX_POWER)
+            distance = rssi_to_distance(rssi, tx_power=sensor_tx_power)
             weight = sensor_weights.get(mac, 1.0)
             sensors_list.append(sensor_data[mac]["position"])
             distances_list.append(distance * weight)
@@ -141,7 +143,14 @@ def get_live_position():
         training_logger.info(f"[TRAINING] Actual: {actual}, Estimated: {estimated}, Error: {error:.2f}, Score: {score:.2f}")
         global_state["training_score"] = score
 
-    return final_prediction
+    if 'last_position' not in global_state:
+        global_state['last_position'] = final_prediction
+    alpha = 0.5  # smoothing factor
+    smoothed_position = alpha * final_prediction + (1 - alpha) * global_state['last_position']
+    global_state['last_position'] = smoothed_position
+
+    return smoothed_position
+#    return final_prediction
 
 def get_device_position(yaml_file, mac_address):
     from utils import load_yaml, rssi_to_distance
